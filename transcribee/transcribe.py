@@ -103,6 +103,14 @@ def run(
 
     wav_path = ensure_wav(audio_path)
 
+    # WAV header alone is 44 bytes — anything smaller means no audio was captured.
+    if wav_path.stat().st_size <= 44:
+        raise ValueError(
+            f"Recording produced no audio ({wav_path.stat().st_size} bytes). "
+            "Check that 'Screen & System Audio Recording' is enabled in "
+            "System Settings → Privacy & Security and that system audio is playing."
+        )
+
     diar_segments = diarize.run(wav_path, backend=diarize_backend, num_speakers=num_speakers)
 
     whisper_lang = None if language == "auto" else language

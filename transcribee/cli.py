@@ -145,13 +145,17 @@ def run(
     console.print("\n[bold cyan]Step 2/3 — Transcribing[/bold cyan]")
     language = lang or cfg.language
     diarize_backend = "none" if no_diarize else cfg.diarization
-    tx.run(
-        audio_path=audio_path,
-        language=language,
-        diarize_backend=diarize_backend,
-        num_speakers=cfg.num_speakers,
-        out_path=transcript_path,
-    )
+    try:
+        tx.run(
+            audio_path=audio_path,
+            language=language,
+            diarize_backend=diarize_backend,
+            num_speakers=cfg.num_speakers,
+            out_path=transcript_path,
+        )
+    except ValueError as e:
+        console.print(f"[red]Transcription failed:[/red] {e}")
+        raise typer.Exit(1)
     console.print(f"  [green]Transcript:[/green] {transcript_path}")
 
     if no_summarize:

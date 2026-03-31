@@ -62,7 +62,8 @@ def test_language_auto_maps_to_none():
     """'auto' language → None passed to faster-whisper model.transcribe."""
     tmp = Path(tempfile.mkdtemp())
     wav = tmp / "audio.wav"
-    wav.write_bytes(b"RIFF\x00\x00\x00\x00WAVEfmt ")  # minimal WAV header
+    # 44-byte WAV header + 2 bytes of data so the empty-audio check passes
+    wav.write_bytes(b"RIFF\x2e\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x80\x3e\x00\x00\x00\x7d\x00\x00\x02\x00\x10\x00data\x02\x00\x00\x00\x00\x00")
 
     mock_seg = MagicMock()
     mock_seg.start = 0.0

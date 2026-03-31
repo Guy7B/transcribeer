@@ -18,7 +18,14 @@ def _run_pyannote(wav_path: Path, num_speakers: int | None) -> list[tuple[float,
     import torchaudio
 
     pipeline = _load_pyannote_pipeline()
-    waveform, sample_rate = torchaudio.load(str(wav_path))
+    try:
+        waveform, sample_rate = torchaudio.load(str(wav_path))
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"Failed to load audio for diarization: {wav_path}\n"
+            "The file may be empty or contain no audio frames. "
+            "Ensure the recording captured system audio."
+        ) from e
     kwargs = {}
     if num_speakers:
         kwargs["num_speakers"] = num_speakers
