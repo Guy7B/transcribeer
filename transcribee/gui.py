@@ -7,9 +7,16 @@ import threading
 import time
 from pathlib import Path
 
+import AppKit
 import rumps
 
 from transcribee.config import load
+
+# us.zoom.caphost only runs when a Zoom meeting is active (not just Zoom idle)
+_ZOOM_MEETING_BUNDLE = "us.zoom.caphost"
+
+_TICK_INTERVAL = 1       # seconds between timer ticks
+_ZOOM_POLL_EVERY = 5     # check Zoom every N ticks
 
 
 class TranscribeeApp(rumps.App):
@@ -22,13 +29,22 @@ class TranscribeeApp(rumps.App):
         self._sess: Path | None = None
         self._record_start: float | None = None
 
+        # Zoom tracking
+        self._zoom_in_meeting = False
+        self._tick_count = 0
+
         # Pre-create all items with explicit callbacks — no @clicked magic
+        self._zoom_item = rumps.MenuItem(
+            "🎥 Zoom meeting detected — Record?", callback=self._on_zoom_record
+        )
         self._status_item = rumps.MenuItem("", callback=None)
         self._open_item = rumps.MenuItem("📁 Open Session Dir", callback=self._on_open)
         self._stop_item = rumps.MenuItem("⏹ Stop Recording", callback=self._on_stop)
         self._start_item = rumps.MenuItem("Start Recording", callback=self._on_start)
 
         self.menu = [
+            self._zoom_item,
+            None,  # separator (hidden when zoom_item hidden)
             self._status_item,
             self._open_item,
             self._stop_item,
@@ -36,21 +52,51 @@ class TranscribeeApp(rumps.App):
             self._start_item,
         ]
 
-        # 1-second tick to update elapsed time while recording
-        self._timer = rumps.Timer(self._tick, 1)
+        self._timer = rumps.Timer(self._tick, _TICK_INTERVAL)
         self._timer.start()
 
         self._set_idle()
+        self._check_zoom()  # detect meeting already in progress at launch
 
     # ── Timer ─────────────────────────────────────────────────────────────────
 
     def _tick(self, _timer):
+        self._tick_count += 1
+
+        # Update elapsed time while recording
         if self._record_start is not None and self._capture_proc is not None:
             elapsed = int(time.time() - self._record_start)
             m, s = divmod(elapsed, 60)
             self._status_item.title = f"⏺ Recording  {m:02d}:{s:02d}"
 
+        # Poll Zoom meeting status every N seconds
+        if self._tick_count % _ZOOM_POLL_EVERY == 0:
+            self._check_zoom()
+
+    def _check_zoom(self):
+        """Show/hide the Zoom suggestion based on us.zoom.caphost presence."""
+        workspace = AppKit.NSWorkspace.sharedWorkspace()
+        now_in_meeting = any(
+            app.bundleIdentifier() == _ZOOM_MEETING_BUNDLE
+            for app in workspace.runningApplications()
+        )
+
+        if now_in_meeting == self._zoom_in_meeting:
+            return  # no change
+
+        self._zoom_in_meeting = now_in_meeting
+        recording_active = self._thread is not None and self._thread.is_alive()
+
+        if now_in_meeting and not recording_active:
+            self._zoom_item.hidden = False
+        else:
+            self._zoom_item.hidden = True
+
     # ── Menu callbacks ────────────────────────────────────────────────────────
+
+    def _on_zoom_record(self, _):
+        self._zoom_item.hidden = True
+        self._on_start(None)
 
     def _on_start(self, _):
         self._stop_event.clear()
@@ -62,8 +108,7 @@ class TranscribeeApp(rumps.App):
         proc = self._capture_proc
         if proc:
             proc.send_signal(signal.SIGINT)
-        # Disable stop button immediately so double-clicks don't re-fire
-        self._stop_item.set_callback(None)
+        self._stop_item.set_callback(None)  # prevent double-fire
 
     def _on_open(self, _):
         if self._sess:
@@ -135,7 +180,7 @@ class TranscribeeApp(rumps.App):
 
         self._set_done()
 
-    # ── State helpers (called from background thread — rumps/PyObjC is ok) ───
+    # ── State helpers ─────────────────────────────────────────────────────────
 
     def _set_idle(self):
         self.title = "🎙"
@@ -143,6 +188,8 @@ class TranscribeeApp(rumps.App):
         self._open_item.hidden = True
         self._stop_item.hidden = True
         self._start_item.hidden = False
+        # Zoom suggestion visible only if meeting is active
+        self._zoom_item.hidden = not self._zoom_in_meeting
 
     def _set_recording(self):
         self._record_start = time.time()
@@ -151,8 +198,9 @@ class TranscribeeApp(rumps.App):
         self._status_item.hidden = False
         self._open_item.hidden = False
         self._stop_item.hidden = False
-        self._stop_item.set_callback(self._on_stop)  # re-arm after any previous disable
+        self._stop_item.set_callback(self._on_stop)
         self._start_item.hidden = True
+        self._zoom_item.hidden = True  # already accepted or manually started
 
     def _set_status(self, label: str):
         self.title = label.split()[0]
@@ -161,6 +209,7 @@ class TranscribeeApp(rumps.App):
         self._open_item.hidden = False
         self._stop_item.hidden = True
         self._start_item.hidden = True
+        self._zoom_item.hidden = True
 
     def _set_done(self):
         self.title = "✓"
@@ -169,15 +218,17 @@ class TranscribeeApp(rumps.App):
         self._open_item.hidden = False
         self._stop_item.hidden = True
         self._start_item.hidden = False
+        self._zoom_item.hidden = not self._zoom_in_meeting
         rumps.notification("Transcribee", "Done", str(self._sess), sound=False)
 
     def _set_error(self, msg: str):
         self.title = "⚠"
-        self._status_item.title = f"⚠ Error"
+        self._status_item.title = "⚠ Error"
         self._status_item.hidden = False
         self._open_item.hidden = self._sess is None
         self._stop_item.hidden = True
         self._start_item.hidden = False
+        self._zoom_item.hidden = not self._zoom_in_meeting
         rumps.alert(title="Transcribee Error", message=msg)
 
 
