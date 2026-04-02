@@ -1,7 +1,18 @@
 [project]
 name = "transcribeer"
 version = "0.1.0"
+description = "Local-first meeting transcription and summarization for macOS"
+readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.11"
+keywords = ["transcription", "macos", "whisper", "meeting", "audio", "diarization"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
 dependencies = [
     "typer>=0.12",
     "rich>=13",
@@ -10,6 +21,11 @@ dependencies = [
     "torchaudio",
     "requests",
 ]
+
+[project.urls]
+Homepage = "https://github.com/moshebeladev/transcribeer"
+Repository = "https://github.com/moshebeladev/transcribeer"
+"Bug Tracker" = "https://github.com/moshebeladev/transcribeer/issues"
 
 [project.optional-dependencies]
 openai = ["openai>=1"]
