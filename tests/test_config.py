@@ -65,3 +65,42 @@ def test_paths_expanded(monkeypatch, tmp_path):
     cfg = load()
     assert not str(cfg.sessions_dir).startswith("~")
     assert not str(cfg.capture_bin).startswith("~")
+
+
+def test_prompt_on_stop_default_true(monkeypatch, tmp_path):
+    """Missing config → prompt_on_stop defaults to True."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from transcribeer.config import load
+    cfg = load()
+    assert cfg.prompt_on_stop is True
+
+
+def test_prompt_on_stop_false_from_toml(monkeypatch, tmp_path):
+    cfg_dir = tmp_path / ".transcribeer"
+    cfg_dir.mkdir()
+    (cfg_dir / "config.toml").write_text("[summarization]\nprompt_on_stop = false\n")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from transcribeer.config import load
+    cfg = load()
+    assert cfg.prompt_on_stop is False
+
+
+def test_save_round_trips_prompt_on_stop(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from transcribeer.config import load, save, Config
+    cfg = load()
+    cfg_off = Config(
+        language=cfg.language,
+        diarization=cfg.diarization,
+        num_speakers=cfg.num_speakers,
+        llm_backend=cfg.llm_backend,
+        llm_model=cfg.llm_model,
+        ollama_host=cfg.ollama_host,
+        sessions_dir=cfg.sessions_dir,
+        capture_bin=cfg.capture_bin,
+        pipeline_mode=cfg.pipeline_mode,
+        prompt_on_stop=False,
+    )
+    save(cfg_off)
+    reloaded = load()
+    assert reloaded.prompt_on_stop is False
