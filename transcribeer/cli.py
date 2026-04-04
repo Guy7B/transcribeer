@@ -95,16 +95,27 @@ def summarize(
     transcript: Path = typer.Argument(..., help="Transcript .txt file."),
     out: Optional[Path] = typer.Option(None, "--out", "-o", help="Output .md path."),
     backend: Optional[str] = typer.Option(None, "--backend", help="LLM backend: openai, anthropic, ollama."),
+    profile: Optional[str] = typer.Option(None, "--profile", help="Named prompt profile from ~/.transcribeer/prompts/."),
+    prompt_file: Optional[Path] = typer.Option(None, "--prompt-file", help="One-off prompt file (overrides --profile)."),
 ):
     """Summarize a transcript using an LLM."""
     from transcribeer import summarize as sm
+    from transcribeer.prompts import load_prompt
     cfg = _cfg()
 
     llm_backend = backend or cfg.llm_backend
     out_path = out or transcript.with_suffix(".summary.md")
 
+    if prompt_file:
+        prompt = prompt_file.read_text(encoding="utf-8")
+    else:
+        prompt = load_prompt(profile)
+
     console.print(f"[bold]Summarizing:[/bold] {transcript}")
     console.print(f"  Backend: {llm_backend} / {cfg.llm_model}")
+    if profile or prompt_file:
+        label = str(prompt_file) if prompt_file else profile
+        console.print(f"  Prompt: {label}")
 
     text = transcript.read_text(encoding="utf-8")
     try:
@@ -114,6 +125,7 @@ def summarize(
                 backend=llm_backend,
                 model=cfg.llm_model,
                 ollama_host=cfg.ollama_host,
+                prompt=prompt,
             )
     except ValueError as e:
         console.print(f"[red]Error:[/red] {e}")
@@ -129,9 +141,11 @@ def run(
     lang: Optional[str] = typer.Option(None, "--lang"),
     no_diarize: bool = typer.Option(False, "--no-diarize"),
     no_summarize: bool = typer.Option(False, "--no-summarize"),
+    profile: Optional[str] = typer.Option(None, "--profile", help="Named prompt profile from ~/.transcribeer/prompts/."),
 ):
     """Record → transcribe → summarize in one shot."""
     from transcribeer import capture, transcribe as tx, summarize as sm, session
+    from transcribeer.prompts import load_prompt
     cfg = _cfg()
 
     sess = session.new_session(sessions_dir=cfg.sessions_dir)
@@ -191,6 +205,7 @@ def run(
     # 3. Summarize
     console.print("\n[bold cyan]Step 3/3 — Summarizing[/bold cyan]")
     text = transcript_path.read_text(encoding="utf-8")
+    prompt = load_prompt(profile)
     try:
         with console.status("[cyan]Summarizing...[/cyan]"):
             summary = sm.run(
@@ -198,6 +213,7 @@ def run(
                 backend=cfg.llm_backend,
                 model=cfg.llm_model,
                 ollama_host=cfg.ollama_host,
+                prompt=prompt,
             )
     except ValueError as e:
         console.print(f"[yellow]Summarization skipped:[/yellow] {e}")
