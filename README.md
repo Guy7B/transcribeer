@@ -43,7 +43,7 @@ Transcribeer captures both sides of any call, transcribes with speaker labels, a
 ## Install
 
 ```bash
-brew tap moshebe/transcribeer
+brew tap moshebe/pkg
 brew install transcribeer
 ```
 
