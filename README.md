@@ -38,14 +38,23 @@ Transcribeer captures both sides of any call, transcribes with speaker labels, a
 
 - macOS 13 (Ventura) or later
 - Apple Silicon (arm64) — Intel builds require compiling the Swift capture binary from source
-- [Homebrew](https://brew.sh)
 
 ## Install
+
+**Homebrew (recommended):**
 
 ```bash
 brew tap moshebe/pkg
 brew install transcribeer
 ```
+
+**Without Homebrew — via [uv](https://github.com/astral-sh/uv):**
+
+```bash
+uv tool install "transcribeer[gui,resemblyzer,openai,anthropic]"
+```
+
+Then copy `capture-bin` to `~/.transcribeer/bin/capture-bin` and set `capture_bin` in `~/.transcribeer/config.toml` (see Configuration below).
 
 ## Running Permanently (auto-start on login)
 
