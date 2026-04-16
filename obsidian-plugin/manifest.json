@@ -1,0 +1,9 @@
+{
+  "id": "transcribeer",
+  "name": "Transcribeer",
+  "version": "0.1.0",
+  "minAppVersion": "1.0.0",
+  "description": "Auto-import transcribeer meeting transcriptions and summaries into your vault.",
+  "author": "moshebe",
+  "isDesktopOnly": true
+}

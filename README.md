@@ -3,7 +3,7 @@
   <h1>Transcribeer 🍺</h1>
   <p><strong>Local-first meeting transcription and summarization for macOS</strong></p>
   <p>
-    <img src="https://img.shields.io/badge/macOS-13%2B-blue?logo=apple" alt="macOS 13+"/>
+    <img src="https://img.shields.io/badge/macOS-15%2B-blue?logo=apple" alt="macOS 15+"/>
     <img src="https://img.shields.io/badge/Apple_Silicon-arm64-green" alt="Apple Silicon"/>
     <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"/>
   </p>
@@ -11,33 +11,32 @@
 
 ---
 
-Transcribeer captures both sides of any call, transcribes with speaker labels, and optionally summarizes with an LLM — all running locally on your Mac. No cloud required.
+Transcribeer captures both sides of any call, transcribes with speaker labels, and optionally summarizes with an LLM — all running locally on your Mac. No cloud required. Zero Python dependencies.
 
 ## Features
 
 - **System audio capture** — records both microphone and speaker audio via Apple ScreenCaptureKit
-- **Local transcription** — [faster-whisper](https://github.com/SYSTRAN/faster-whisper) + [ivrit-ai](https://huggingface.co/ivrit-ai) model, optimised for Hebrew and English
-- **Speaker diarization** — who said what, via [pyannote.audio](https://github.com/pyannote/pyannote-audio) or [resemblyzer](https://github.com/resemble-ai/Resemblyzer)
+- **On-device transcription** — [WhisperKit](https://github.com/argmaxinc/WhisperKit) (CoreML, Apple Silicon optimized)
+- **Speaker diarization** — who said what, via [SpeakerKit](https://github.com/argmaxinc/WhisperKit) (Pyannote backend)
 - **LLM summarization** — Ollama (local), OpenAI, or Anthropic
 - **Custom summary profiles** — swap in a different prompt per session without touching config
 - **Native macOS menubar app** — start/stop recording from the menu bar, session browser, settings UI
-- **CLI** — scriptable, composable pipeline (`record → transcribe → summarize`)
 
 ## Tech Stack
 
 | Layer | Technology |
 |-------|-----------|
 | Audio capture | [Apple ScreenCaptureKit](https://developer.apple.com/documentation/screencapturekit) (Swift) |
-| Transcription | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) + [ivrit-ai model](https://huggingface.co/ivrit-ai) |
-| Diarization | [pyannote.audio](https://github.com/pyannote/pyannote-audio) / [resemblyzer](https://github.com/resemble-ai/Resemblyzer) |
+| Transcription | [WhisperKit](https://github.com/argmaxinc/WhisperKit) (CoreML, on-device) |
+| Diarization | [SpeakerKit](https://github.com/argmaxinc/WhisperKit) (Pyannote, on-device) |
 | Summarization | [Ollama](https://ollama.ai) (local), [OpenAI](https://openai.com), [Anthropic](https://anthropic.com) |
-| GUI | [rumps](https://github.com/jaredks/rumps) (menubar) + WKWebView (native windows) |
+| GUI | Native SwiftUI menubar app |
 | Credentials | macOS Keychain (API keys stored securely per-service) |
 
 ## Requirements
 
-- macOS 13 (Ventura) or later
-- Apple Silicon (arm64) — Intel builds require compiling the Swift capture binary from source
+- macOS 15 (Sequoia) or later
+- Apple Silicon (arm64)
 
 ## Install
 
@@ -48,13 +47,13 @@ brew tap moshebe/pkg
 brew install transcribeer
 ```
 
-**Without Homebrew — via [uv](https://github.com/astral-sh/uv):**
+**From source:**
 
 ```bash
-uv tool install "transcribeer[gui,resemblyzer,openai,anthropic]"
+git clone https://github.com/moshebe/transcribeer.git
+cd transcribeer
+make dev
 ```
-
-Then copy `capture-bin` to `~/.transcribeer/bin/capture-bin` and set `capture_bin` in `~/.transcribeer/config.toml` (see Configuration below).
 
 ## Running Permanently (auto-start on login)
 
@@ -71,36 +70,30 @@ brew services stop transcribeer
 ## First Run
 
 ```bash
-transcribeer-gui          # launch the menubar app (recommended)
-transcribeer --help       # CLI usage
+make gui                  # build + launch the native menubar app
 ```
 
-The first transcription will automatically download the Whisper model (~1.5 GB). This is a one-time download.
-
-## CLI Usage
-
-```bash
-transcribeer run --duration 300        # record 5 min, transcribe, summarize
-transcribeer record                    # record until Ctrl+C
-transcribeer transcribe audio.wav      # transcribe an existing file
-transcribeer summarize session.txt     # summarize a transcript
-transcribeer summarize session.txt --profile meeting   # use a custom profile
-```
+The first transcription will automatically download the WhisperKit model (~1.5 GB) and SpeakerKit models. This is a one-time download stored in `~/.transcribeer/models/`.
 
 ## Configuration
 
 Config is stored at `~/.transcribeer/config.toml`:
 
 ```toml
+[pipeline]
+mode = "record+transcribe+summarize"   # record-only, record+transcribe, record+transcribe+summarize
+zoom_auto_record = false
+
 [transcription]
-language = "auto"           # auto, he, en
-diarization = "resemblyzer" # pyannote, resemblyzer, none
+language = "auto"           # auto, he, en, etc.
+diarization = "pyannote"    # pyannote, none
 num_speakers = 0            # 0 = auto-detect
 
 [summarization]
 backend = "ollama"          # ollama, openai, anthropic
 model = "llama3"
 ollama_host = "http://localhost:11434"
+prompt_on_stop = true
 ```
 
 ### API Keys
@@ -126,7 +119,6 @@ EOF
 **Use a profile:**
 
 - **Menubar**: click **Profile** in the menu during or after a recording and type the profile name
-- **CLI**: pass `--profile standup` to `transcribeer summarize` or `transcribeer run`
 
 The built-in default prompt is used when no profile is selected. Profiles live in `~/.transcribeer/prompts/*.md`; the filename (without `.md`) is the profile name.
 
