@@ -18,5 +18,7 @@
     <true/>
     <key>NSUserNotificationsUsageDescription</key>
     <string>Alerts when transcription is complete.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Transcribeer records system audio to transcribe meetings and calls.</string>
 </dict>
 </plist>

@@ -4,6 +4,9 @@ import PackageDescription
 let package = Package(
     name: "capture",
     platforms: [.macOS(.v13)],
+    products: [
+        .library(name: "CaptureCore", targets: ["CaptureCore"]),
+    ],
     targets: [
         .target(
             name: "CaptureCore",
