@@ -4,6 +4,7 @@ import TOMLDecoder
 public struct AppConfig: Equatable, Sendable {
     public var language: String = "auto"
     public var whisperModel: String = "openai_whisper-large-v3_turbo"
+    public var whisperModelRepo: String = ""
     public var diarization: String = "pyannote"
     public var numSpeakers: Int = 0
     public var llmBackend: String = "ollama"
@@ -26,10 +27,16 @@ public struct AppConfig: Equatable, Sendable {
     }
 
     public static func defaultCaptureBin() -> String {
+        // 1. Bundled inside .app — inherits TCC from parent app (preferred)
+        if let bundled = Bundle.main.url(forAuxiliaryExecutable: "capture-bin") {
+            return bundled.path
+        }
+        // 2. Homebrew install
         let brewPath = "/opt/homebrew/opt/transcribeer/libexec/bin/capture-bin"
         if FileManager.default.fileExists(atPath: brewPath) {
             return brewPath
         }
+        // 3. Manual install
         return "~/.transcribeer/bin/capture-bin"
     }
 
@@ -56,6 +63,7 @@ private struct PipelineSection: Decodable {
 private struct TranscriptionSection: Decodable {
     var language: String?
     var model: String?
+    var model_repo: String?
     var diarization: String?
     var num_speakers: Int?
 }
@@ -92,6 +100,7 @@ public enum ConfigManager {
         if let t = toml.transcription {
             if let v = t.language { cfg.language = v }
             if let v = t.model { cfg.whisperModel = v }
+            if let v = t.model_repo { cfg.whisperModelRepo = v }
             if let v = t.diarization { cfg.diarization = v }
             if let v = t.num_speakers { cfg.numSpeakers = v }
         }
@@ -120,6 +129,7 @@ public enum ConfigManager {
         [transcription]
         language = "\(cfg.language)"
         model = "\(cfg.whisperModel)"
+        model_repo = "\(cfg.whisperModelRepo)"
         diarization = "\(cfg.diarization)"
         num_speakers = \(cfg.numSpeakers)
 
