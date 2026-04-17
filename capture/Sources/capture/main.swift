@@ -5,7 +5,7 @@ import CaptureCore
 // ── 1. Parse args ────────────────────────────────────────────────────────────
 let args = CommandLine.arguments
 guard args.count >= 2 else {
-    fputs("Usage: capture <output.wav> [duration_seconds]\n", stderr)
+    fputs("Usage: capture <output.m4a> [duration_seconds]\n", stderr)
     exit(1)
 }
 let outputPath = args[1]
@@ -26,10 +26,10 @@ guard CGPreflightScreenCaptureAccess() else {
     exit(1)
 }
 
-// ── 3. Open WAV writer ───────────────────────────────────────────────────────
-let writer = WAVWriter.shared
+// ── 3. Open audio writer ─────────────────────────────────────────────────────
+let writer = AudioFileWriter.shared
 do {
-    try writer.open(path: outputPath)
+    try writer.open(url: URL(fileURLWithPath: outputPath))
 } catch {
     fputs("Cannot write to \(outputPath): \(error)\n", stderr)
     exit(1)
@@ -40,7 +40,7 @@ var stopped = false
 let startTime = Date()
 func shutdown() {
     AudioCapture.shared.stop()
-    WAVWriter.shared.close()
+    AudioFileWriter.shared.close()
     let elapsed = Int(Date().timeIntervalSince(startTime))
     let m = elapsed / 60, s = elapsed % 60
     let size = (try? FileManager.default.attributesOfItem(atPath: outputPath)[.size] as? Int) ?? 0

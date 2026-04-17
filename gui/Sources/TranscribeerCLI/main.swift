@@ -34,7 +34,7 @@ struct Record: AsyncParsableCommand {
             outPath = (out as NSString).expandingTildeInPath
         } else {
             let sess = SessionManager.newSession(sessionsDir: cfg.expandedSessionsDir)
-            outPath = sess.appendingPathComponent("audio.wav").path
+            outPath = sess.appendingPathComponent("audio.m4a").path
         }
 
         print("Recording → \(outPath)")
@@ -162,7 +162,7 @@ struct Run: AsyncParsableCommand {
     func run() async throws {
         let cfg = ConfigManager.load()
         let sess = SessionManager.newSession(sessionsDir: cfg.expandedSessionsDir)
-        let audioPath = sess.appendingPathComponent("audio.wav")
+        let audioPath = sess.appendingPathComponent("audio.m4a")
         let txPath = sess.appendingPathComponent("transcript.txt")
         let summaryPath = sess.appendingPathComponent("summary.md")
 

@@ -16,7 +16,7 @@ APP_RESOURCES = $(APP_CONTENTS)/Resources
 OBSIDIAN_VAULT ?= $(HOME)/Library/Mobile Documents/com~apple~CloudDocs/$(shell id -un)
 OBSIDIAN_PLUGIN_DIR = $(OBSIDIAN_VAULT)/.obsidian/plugins/transcribeer
 
-.PHONY: gui gui-build build-dev capture test-capture logs help dev dev-uninstall dev-restart obsidian-plugin
+.PHONY: gui gui-build build-dev capture test-capture logs help dev dev-uninstall dev-restart obsidian-plugin lint lint-fix lint-strict
 
 help:
 	@echo "dev targets:"
@@ -30,6 +30,22 @@ help:
 	@echo "  make test-capture   test capture-bin directly (5s recording)"
 	@echo "  make logs           stream transcribeer process logs"
 	@echo "  make obsidian-plugin  build + install Obsidian plugin into vault"
+	@echo "  make lint           run swiftlint (requires: brew install swiftlint)"
+	@echo "  make lint-fix       auto-fix swiftlint-correctable violations"
+	@echo "  make lint-strict    run swiftlint with --strict (warnings fail)"
+
+# ── lint ──────────────────────────────────────────────────────────────────────
+lint:
+	@command -v swiftlint >/dev/null || { echo "swiftlint not installed. Run: brew install swiftlint"; exit 1; }
+	swiftlint lint --config $(PROJECT_DIR)/.swiftlint.yml
+
+lint-fix:
+	@command -v swiftlint >/dev/null || { echo "swiftlint not installed. Run: brew install swiftlint"; exit 1; }
+	swiftlint lint --fix --config $(PROJECT_DIR)/.swiftlint.yml
+
+lint-strict:
+	@command -v swiftlint >/dev/null || { echo "swiftlint not installed. Run: brew install swiftlint"; exit 1; }
+	swiftlint lint --strict --config $(PROJECT_DIR)/.swiftlint.yml
 
 # ── dev install + launch agent ────────────────────────────────────────────────
 define PLIST_CONTENT

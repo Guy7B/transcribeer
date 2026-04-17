@@ -8,7 +8,7 @@ public class AudioCapture: NSObject {
     public var onStreamStopped: (() -> Void)?
 
     private var stream: SCStream?
-    private var writer: WAVWriter?
+    private var writer: AudioFileWriter?
 
     // Thread-safe accepting flag
     private let acceptingLock = NSLock()
@@ -27,7 +27,7 @@ public class AudioCapture: NSObject {
     private var converter: AVAudioConverter?
     private var lastSrcFormat: AVAudioFormat?
 
-    public func start(writer: WAVWriter) async throws {
+    public func start(writer: AudioFileWriter) async throws {
         self.writer = writer
         self.accepting = true
         converterLock.withLock {
@@ -72,7 +72,7 @@ public class AudioCapture: NSObject {
     // MARK: - Private helpers
 
     private func converterFor(_ srcFormat: AVAudioFormat) -> AVAudioConverter? {
-        return converterLock.withLock { () -> AVAudioConverter? in
+        converterLock.withLock {
             if let c = converter, lastSrcFormat?.isEqual(srcFormat) == true { return c }
             guard let c = AVAudioConverter(from: srcFormat, to: dstFormat) else {
                 return nil
@@ -177,14 +177,6 @@ extension AudioCapture: SCStreamOutput {
         }
         guard convError == nil, dstBuf.frameLength > 0 else { return }
 
-        // Float32 → Int16, clamped per-sample.
-        let floats = dstBuf.floatChannelData![0]
-        let count = Int(dstBuf.frameLength)
-        var int16s = [Int16](repeating: 0, count: count)
-        for i in 0..<count {
-            let clamped = max(-1.0, min(1.0, floats[i]))
-            int16s[i] = Int16(clamped * 32767)
-        }
-        writer?.append(int16s)
+        writer?.append(dstBuf)
     }
 }

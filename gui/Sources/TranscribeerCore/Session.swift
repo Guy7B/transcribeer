@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 
 public struct Session: Identifiable, Equatable, Sendable {
@@ -111,7 +112,7 @@ public enum SessionManager {
 
         let txPath = dir.appendingPathComponent("transcript.txt")
         let smPath = dir.appendingPathComponent("summary.md")
-        let audioPath = dir.appendingPathComponent("audio.wav")
+        let audioPath = dir.appendingPathComponent("audio.m4a")
 
         let hasAudio = FileManager.default.fileExists(atPath: audioPath.path)
 
@@ -166,32 +167,14 @@ public enum SessionManager {
     // MARK: - Helpers
 
     public static func audioDuration(_ dir: URL) -> String {
-        let path = dir.appendingPathComponent("audio.wav")
+        let path = dir.appendingPathComponent("audio.m4a")
         guard FileManager.default.fileExists(atPath: path.path) else { return "—" }
-
-        guard let handle = try? FileHandle(forReadingFrom: path) else { return "—" }
-        defer { try? handle.close() }
-
-        let header = handle.readData(ofLength: 44)
-        guard header.count == 44 else { return "—" }
-
-        let sampleRate = header.withUnsafeBytes { buf -> UInt32 in
-            buf.load(fromByteOffset: 24, as: UInt32.self)
-        }
-        let bitsPerSample = header.withUnsafeBytes { buf -> UInt16 in
-            buf.load(fromByteOffset: 34, as: UInt16.self)
-        }
-        let channels = header.withUnsafeBytes { buf -> UInt16 in
-            buf.load(fromByteOffset: 22, as: UInt16.self)
-        }
-
-        guard sampleRate > 0, bitsPerSample > 0, channels > 0 else { return "—" }
-
-        let fileSize = (try? FileManager.default.attributesOfItem(atPath: path.path)[.size] as? UInt64) ?? 0
-        let dataSize = fileSize - 44
-        let bytesPerSample = UInt64(bitsPerSample) / 8
-        let totalSamples = dataSize / (bytesPerSample * UInt64(channels))
-        let seconds = Int(totalSamples / UInt64(sampleRate))
+        let asset = AVURLAsset(url: path)
+        // Use synchronous CMTime property; the async `load(.duration)` API
+        // cannot be used here as this function is non-async.
+        let duration = asset.duration  // swiftlint:disable:this legacy_objc_type
+        guard duration.isValid, !duration.isIndefinite else { return "—" }
+        let seconds = Int(duration.seconds)
         let m = seconds / 60
         let s = seconds % 60
         return String(format: "%d:%02d", m, s)

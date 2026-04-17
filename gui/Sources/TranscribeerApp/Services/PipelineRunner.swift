@@ -41,7 +41,7 @@ final class PipelineRunner {
     }
 
     private func runPipeline(session: URL, config: AppConfig) async {
-        let audioPath = session.appendingPathComponent("audio.wav")
+        let audioPath = session.appendingPathComponent("audio.m4a")
         let transcriptPath = session.appendingPathComponent("transcript.txt")
         let summaryPath = session.appendingPathComponent("summary.md")
         let logPath = session.appendingPathComponent("run.log")
@@ -201,7 +201,7 @@ final class PipelineRunner {
 
     /// Re-transcribe a session from its audio.
     func transcribeSession(_ session: URL, config: AppConfig) async -> CLIResult {
-        let audioPath = session.appendingPathComponent("audio.wav")
+        let audioPath = session.appendingPathComponent("audio.m4a")
         let txPath = session.appendingPathComponent("transcript.txt")
 
         guard FileManager.default.fileExists(atPath: audioPath.path) else {
