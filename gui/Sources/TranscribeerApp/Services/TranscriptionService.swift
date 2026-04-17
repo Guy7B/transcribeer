@@ -12,6 +12,7 @@ final class TranscriptionService {
     var modelState: ModelState = .unloaded
 
     private var whisperKit: WhisperKit?
+    private var kitConfig: WhisperKitConfig?
 
     private static let modelsDir: URL = {
         let home = FileManager.default.homeDirectoryForCurrentUser
@@ -20,8 +21,10 @@ final class TranscriptionService {
 
     /// Load (and download if needed) a WhisperKit model.
     ///
-    /// - Parameter name: Model variant name (e.g. "large-v3-turbo").
-    func loadModel(name: String = "openai_whisper-large-v3_turbo") async throws {
+    /// - Parameters:
+    ///   - name: Model variant name (e.g. "openai_whisper-large-v3_turbo").
+    ///   - repo: Optional HuggingFace repo for a custom/converted model.
+    func loadModel(name: String = "openai_whisper-large-v3_turbo", repo: String = "") async throws {
         guard modelState != .loaded else { return }
 
         modelState = .downloading
@@ -31,7 +34,7 @@ final class TranscriptionService {
             at: downloadBase, withIntermediateDirectories: true
         )
 
-        let config = WhisperKitConfig(
+        var config = WhisperKitConfig(
             model: name,
             downloadBase: downloadBase,
             verbose: false,
@@ -40,6 +43,10 @@ final class TranscriptionService {
             load: true,
             download: true
         )
+        if !repo.isEmpty {
+            config.modelRepo = repo
+        }
+        kitConfig = config
 
         let kit = try await WhisperKit(config)
         kit.modelStateCallback = { [weak self] _, newState in
@@ -53,11 +60,12 @@ final class TranscriptionService {
     }
 
     /// Transcribe an audio file to timestamped segments.
+    /// Automatically uses parallel chunked transcription for recordings longer than
+    /// `ChunkedTranscriber.chunkingThreshold` seconds.
     ///
     /// - Parameters:
-    ///   - audioURL: Path to the audio file (WAV, M4A, etc.).
-    ///   - language: Language code (e.g. "en") or "auto" for detection.
-    /// - Returns: Array of timestamped transcript segments.
+    ///   - audioURL: Path to the audio file (WAV).
+    ///   - language: Language code (e.g. "he") or "auto" for detection.
     func transcribe(
         audioURL: URL,
         language: String = "auto"
@@ -66,10 +74,26 @@ final class TranscriptionService {
             try await loadModel()
         }
 
-        guard let kit = whisperKit else {
+        guard let kit = whisperKit, let config = kitConfig else {
             throw TranscriptionError.modelNotLoaded
         }
 
+        // Use chunked parallel path for long recordings
+        if let duration = AudioChunker.wavDuration(url: audioURL),
+           duration > ChunkedTranscriber.chunkingThreshold {
+            return try await ChunkedTranscriber.transcribe(
+                audioURL: audioURL,
+                modelName: config.model ?? "openai_whisper-large-v3_turbo",
+                modelRepo: config.modelRepo.flatMap { $0.isEmpty ? nil : $0 },
+                downloadBase: Self.modelsDir,
+                language: language,
+                onProgress: { [weak self] p in
+                    Task { @MainActor in self?.progress = p }
+                }
+            )
+        }
+
+        // Short file — use already-loaded kit directly
         progress = 0
 
         let lang: String? = language == "auto" ? nil : language
@@ -115,6 +139,7 @@ final class TranscriptionService {
             whisperKit = nil
             await kit.unloadModels()
         }
+        kitConfig = nil
         modelState = .unloaded
         progress = nil
     }

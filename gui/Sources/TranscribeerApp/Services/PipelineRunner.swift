@@ -20,7 +20,6 @@ final class PipelineRunner {
 
     let transcriptionService = TranscriptionService()
 
-    private var captureProcess: Process?
     private var pipelineTask: Task<Void, Never>?
 
     func startRecording(config: AppConfig) {
@@ -38,9 +37,7 @@ final class PipelineRunner {
 
     func stopRecording() {
         guard state.isRecording else { return }
-        if let proc = captureProcess, proc.isRunning {
-            proc.interrupt()  // SIGINT
-        }
+        CaptureService.stop()
     }
 
     private func runPipeline(session: URL, config: AppConfig) async {
@@ -70,14 +67,16 @@ final class PipelineRunner {
         log("session=\(session.path)")
         log("pipeline=\(config.pipelineMode) lang=\(config.language) diarize=\(config.diarization)")
 
-        // 1. Record — use capture-bin directly
-        log("capture-bin=\(config.expandedCaptureBin)")
-        let recordResult = await runCapture(
-            captureBin: config.expandedCaptureBin,
-            audioPath: audioPath
-        )
+        // 1. Record — in-process via CaptureCore (uses app's TCC permission)
+        log("capture started")
+        let recordResult = await CaptureService.record(to: audioPath, duration: nil)
 
         switch recordResult {
+        case .permissionDenied:
+            let err = "Grant Screen Recording in System Settings → Privacy"
+            log(err)
+            state = .error(err)
+            return
         case .error(let err):
             log("capture failed: \(err)")
             state = .error(err)
@@ -90,7 +89,7 @@ final class PipelineRunner {
         case .recorded:
             let size = (try? FileManager.default.attributesOfItem(
                 atPath: audioPath.path
-            )[.size] as? Int ?? 0) ?? 0
+            )[.size] as? UInt64) ?? 0
             log("recorded \(size) bytes")
         }
 
@@ -109,6 +108,7 @@ final class PipelineRunner {
                 audioPath: audioPath,
                 language: config.language,
                 model: config.whisperModel,
+                modelRepo: config.whisperModelRepo,
                 diarization: config.diarization,
                 numSpeakers: config.numSpeakers
             )
@@ -159,11 +159,12 @@ final class PipelineRunner {
         audioPath: URL,
         language: String,
         model: String,
+        modelRepo: String = "",
         diarization: String,
         numSpeakers: Int
     ) async throws -> String {
         // Ensure the configured model is loaded
-        try await transcriptionService.loadModel(name: model)
+        try await transcriptionService.loadModel(name: model, repo: modelRepo)
 
         // Run transcription
         let whisperSegments = try await transcriptionService.transcribe(
@@ -190,74 +191,6 @@ final class PipelineRunner {
         return TranscriptFormatter.format(labeled)
     }
 
-    // MARK: - Capture
-
-    private enum CaptureResult {
-        case recorded
-        case noAudio
-        case error(String)
-    }
-
-    private func runCapture(captureBin: String, audioPath: URL) async -> CaptureResult {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                let proc = Process()
-                proc.executableURL = URL(fileURLWithPath: captureBin)
-                proc.arguments = [audioPath.path]
-                let errPipe = Pipe()
-                proc.standardOutput = FileHandle.nullDevice
-                proc.standardError = errPipe
-
-                do {
-                    try proc.run()
-                } catch {
-                    continuation.resume(returning: .error(
-                        "Failed to launch capture-bin: \(error.localizedDescription)"
-                    ))
-                    return
-                }
-
-                Task { @MainActor in
-                    self?.captureProcess = proc
-                }
-
-                proc.waitUntilExit()
-
-                Task { @MainActor in
-                    self?.captureProcess = nil
-                }
-
-                let stderr = String(
-                    data: errPipe.fileHandleForReading.readDataToEndOfFile(),
-                    encoding: .utf8
-                ) ?? ""
-
-                if proc.terminationStatus != 0 {
-                    if stderr.contains("Screen & System Audio Recording") {
-                        continuation.resume(returning: .error(
-                            "Grant Screen Recording in System Settings → Privacy"
-                        ))
-                    } else {
-                        continuation.resume(returning: .error(
-                            "capture-bin exited \(proc.terminationStatus)"
-                        ))
-                    }
-                    return
-                }
-
-                let exists = FileManager.default.fileExists(atPath: audioPath.path)
-                let size = (try? FileManager.default.attributesOfItem(
-                    atPath: audioPath.path
-                )[.size] as? UInt64) ?? 0
-                if exists && size > 0 {
-                    continuation.resume(returning: .recorded)
-                } else {
-                    continuation.resume(returning: .noAudio)
-                }
-            }
-        }
-    }
-
     // MARK: - History re-runs
 
     /// Result of a pipeline operation.
@@ -282,6 +215,7 @@ final class PipelineRunner {
                 audioPath: audioPath,
                 language: config.language,
                 model: config.whisperModel,
+                modelRepo: config.whisperModelRepo,
                 diarization: config.diarization,
                 numSpeakers: config.numSpeakers
             )
