@@ -1,7 +1,6 @@
 import AppKit
 import os.log
 import UserNotifications
-import TranscribeerCore
 
 private let logger = Logger(subsystem: "com.transcribeer", category: "delegate")
 
