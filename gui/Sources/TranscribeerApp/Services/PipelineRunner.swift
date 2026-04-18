@@ -172,6 +172,7 @@ final class PipelineRunner {
                 audioPath: audioPath,
                 language: config.language,
                 model: config.whisperModel,
+                modelRepo: config.whisperModelRepo,
                 diarization: config.diarization,
                 numSpeakers: config.numSpeakers
             )
@@ -261,17 +262,19 @@ final class PipelineRunner {
 
     // MARK: - Transcription + Diarization + Formatting
 
+    // swiftlint:disable:next function_parameter_count
     private func transcribeAndFormat(
         audioPath: URL,
         language: String,
         model: String,
+        modelRepo: String,
         diarization: String,
         numSpeakers: Int
     ) async throws -> String {
         // Ensure the configured model is loaded. Runs on the service's
         // MainActor but quickly hands off to a background task for the
         // expensive compile/prewarm steps WhisperKit performs internally.
-        try await transcriptionService.loadModel(name: model)
+        try await transcriptionService.loadModel(name: model, repo: modelRepo.isEmpty ? nil : modelRepo)
 
         // Transcription and diarization are independent: both consume the
         // same audio file and produce disjoint segment streams. Run them in
@@ -341,6 +344,7 @@ final class PipelineRunner {
                 audioPath: audioPath,
                 language: language,
                 model: config.whisperModel,
+                modelRepo: config.whisperModelRepo,
                 diarization: config.diarization,
                 numSpeakers: config.numSpeakers
             )

@@ -5,6 +5,7 @@ import TOMLDecoder
 struct AppConfig: Equatable {
     var language: String = "auto"
     var whisperModel: String = "openai_whisper-large-v3_turbo"
+    var whisperModelRepo: String = ""
     var diarization: String = "pyannote"
     var numSpeakers: Int = 0
     var llmBackend: String = "ollama"
@@ -54,6 +55,7 @@ private struct PipelineSection: Decodable {
 private struct TranscriptionSection: Decodable {
     var language: String?
     var model: String?
+    var model_repo: String?
     var diarization: String?
     var num_speakers: Int?
 }
@@ -113,6 +115,7 @@ enum ConfigManager {
         if let transcription = toml.transcription {
             cfg.language = transcription.language ?? cfg.language
             cfg.whisperModel = transcription.model.map(AppConfig.canonicalWhisperModel) ?? cfg.whisperModel
+            cfg.whisperModelRepo = transcription.model_repo ?? cfg.whisperModelRepo
             cfg.diarization = transcription.diarization ?? cfg.diarization
             cfg.numSpeakers = transcription.num_speakers ?? cfg.numSpeakers
         }
@@ -142,6 +145,7 @@ enum ConfigManager {
         [transcription]
         language = "\(cfg.language)"
         model = "\(cfg.whisperModel)"
+        model_repo = "\(cfg.whisperModelRepo)"
         diarization = "\(cfg.diarization)"
         num_speakers = \(speakers)
 

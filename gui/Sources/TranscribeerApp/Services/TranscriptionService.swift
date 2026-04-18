@@ -29,6 +29,8 @@ final class TranscriptionService {
     var liveSegments: [TranscriptSegment] = []
 
     private var whisperKit: WhisperKit?
+    private var loadedModelName: String?
+    private var loadedModelRepo: String?
 
     /// The currently running transcription. Stored so the caller can cancel it.
     private var activeTask: Task<[TranscriptSegment], Error>?
@@ -50,11 +52,17 @@ final class TranscriptionService {
 
     /// Load (and download if needed) a WhisperKit model.
     ///
-    /// - Parameter name: WhisperKit model identifier, matching a folder in
-    ///   `argmaxinc/whisperkit-coreml` (e.g. `"openai_whisper-large-v3_turbo"`).
-    ///   Legacy short names (e.g. `"large-v3-turbo"`) are migrated automatically.
-    func loadModel(name: String = "openai_whisper-large-v3_turbo") async throws {
-        guard modelState != .loaded else { return }
+    /// - Parameters:
+    ///   - name: WhisperKit model identifier (e.g. `"openai_whisper-large-v3_turbo"`).
+    ///     Legacy short names (e.g. `"large-v3-turbo"`) are migrated automatically.
+    ///   - repo: Optional HuggingFace repo (`"owner/repo-name"`) to download from.
+    ///     Pass `nil` to use the default `argmaxinc/whisperkit-coreml` repo.
+    func loadModel(name: String = "openai_whisper-large-v3_turbo", repo: String? = nil) async throws {
+        let modelRepo = repo.flatMap { $0.isEmpty ? nil : $0 }
+        let alreadyLoaded = modelState == .loaded
+            && loadedModelName == name
+            && loadedModelRepo == modelRepo
+        guard !alreadyLoaded else { return }
 
         let downloadBase = Self.modelsDir
         try FileManager.default.createDirectory(
@@ -62,7 +70,7 @@ final class TranscriptionService {
         )
 
         let canonical = AppConfig.canonicalWhisperModel(name)
-        let cachedFolder = Self.cachedModelFolder(variant: canonical, downloadBase: downloadBase)
+        let cachedFolder = Self.cachedModelFolder(variant: canonical, downloadBase: downloadBase, repo: modelRepo)
 
         // If the model is already on disk, skip the download branch entirely and
         // start from the load state. Otherwise WhisperKit would still hit the network
@@ -72,6 +80,7 @@ final class TranscriptionService {
         let config = WhisperKitConfig(
             model: canonical,
             downloadBase: downloadBase,
+            modelRepo: modelRepo,
             modelFolder: cachedFolder?.path,
             computeOptions: Self.aneComputeOptions,
             verbose: false,
@@ -90,15 +99,29 @@ final class TranscriptionService {
 
         whisperKit = kit
         modelState = kit.modelState
+        loadedModelName = name
+        loadedModelRepo = modelRepo
     }
 
     /// Returns the on-disk folder for a WhisperKit variant if it's already been
     /// downloaded, matching the layout `HubApi` produces under `downloadBase`.
-    private static func cachedModelFolder(variant: String, downloadBase: URL) -> URL? {
+    private static func cachedModelFolder(variant: String, downloadBase: URL, repo: String?) -> URL? {
+        let owner: String
+        let repoName: String
+        if let repo {
+            let parts = repo.split(separator: "/", maxSplits: 1)
+            guard parts.count == 2 else { return nil }
+            owner = String(parts[0])
+            repoName = String(parts[1])
+        } else {
+            owner = "argmaxinc"
+            repoName = "whisperkit-coreml"
+        }
+
         let folder = downloadBase
             .appendingPathComponent("models", isDirectory: true)
-            .appendingPathComponent("argmaxinc", isDirectory: true)
-            .appendingPathComponent("whisperkit-coreml", isDirectory: true)
+            .appendingPathComponent(owner, isDirectory: true)
+            .appendingPathComponent(repoName, isDirectory: true)
             .appendingPathComponent(variant, isDirectory: true)
 
         // Minimum viable set of CoreML bundles WhisperKit needs to load.
@@ -234,6 +257,8 @@ final class TranscriptionService {
             await kit.unloadModels()
         }
         modelState = .unloaded
+        loadedModelName = nil
+        loadedModelRepo = nil
         progress = nil
         liveSegments = []
     }

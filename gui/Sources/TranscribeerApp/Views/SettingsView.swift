@@ -73,6 +73,11 @@ struct SettingsView: View {
         Form {
             Section {
                 modelPicker
+                TextField("Custom model repo (optional)", text: Binding(
+                    get: { config.whisperModelRepo },
+                    set: { config.whisperModelRepo = $0 }
+                ))
+                .onSubmit { save() }
             } header: {
                 HStack {
                     Text("Whisper model")
@@ -92,6 +97,8 @@ struct SettingsView: View {
             } footer: {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Models are downloaded on first use (~0.1–1.5 GB). Stored in ~/.transcribeer/models/.")
+                    Text("Custom repo: HuggingFace repo for ivrit-ai or other fine-tuned models")
+                    Text("(e.g. owner/ivrit-ai-whisper-large-v3-turbo-coreml).")
                     if let message = modelCatalog.lastError {
                         Text(message).foregroundStyle(.orange)
                     }
