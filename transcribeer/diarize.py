@@ -45,6 +45,28 @@ def _run_pyannote(wav_path: Path, num_speakers: int | None) -> list[tuple[float,
     return segments
 
 
+def _preprocess_wav_preserve_timeline(wav_path: Path):
+    """Load + resample + volume-normalize without trimming silences.
+
+    resemblyzer's ``preprocess_wav`` unconditionally applies
+    ``trim_long_silences``, which removes voiced-only samples via WebRTC VAD
+    and produces a waveform *shorter* than the input. Downstream timestamps
+    would then refer to a trimmed timeline while Whisper segments use the
+    original timeline — a mismatch that left tail segments labelled
+    ``UNKNOWN`` on longer recordings.
+
+    This helper performs only the two safe preprocessing steps — resample to
+    16 kHz and volume-normalize — so diarization timestamps stay aligned with
+    the original audio.
+    """
+    import librosa
+    from resemblyzer.audio import normalize_volume
+    from resemblyzer.hparams import audio_norm_target_dBFS, sampling_rate
+
+    wav, _ = librosa.load(str(wav_path), sr=sampling_rate)
+    return normalize_volume(wav, audio_norm_target_dBFS, increase_only=True)
+
+
 def _run_resemblyzer(wav_path: Path, num_speakers: int | None) -> list[tuple[float, float, str]]:
     try:
         import resemblyzer  # noqa: F401
@@ -58,7 +80,7 @@ def _run_resemblyzer(wav_path: Path, num_speakers: int | None) -> list[tuple[flo
     import resemblyzer
     from sklearn.cluster import AgglomerativeClustering
 
-    wav = resemblyzer.preprocess_wav(str(wav_path))
+    wav = _preprocess_wav_preserve_timeline(wav_path)
     encoder = resemblyzer.VoiceEncoder()
 
     # Segment into 1.5s windows with 0.5s hop

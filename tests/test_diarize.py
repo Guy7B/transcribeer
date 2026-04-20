@@ -66,7 +66,6 @@ def test_resemblyzer_backend_returns_tuples(tmp_path, monkeypatch):
     mock_labels = np.array([0, 0, 1, 1])
 
     mock_resemblyzer = MagicMock()
-    mock_resemblyzer.preprocess_wav.return_value = mock_preprocessed
     mock_resemblyzer.VoiceEncoder.return_value = mock_encoder
 
     mock_cluster = MagicMock()
@@ -78,8 +77,14 @@ def test_resemblyzer_backend_returns_tuples(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "sklearn", MagicMock())
     monkeypatch.setitem(sys.modules, "sklearn.cluster", mock_sklearn_cluster)
 
-    from transcribeer.diarize import run
-    result = run(wav, backend="resemblyzer", num_speakers=2)
+    # The new timeline-preserving preprocess calls librosa + normalize_volume.
+    from unittest.mock import patch
+    with patch(
+        "transcribeer.diarize._preprocess_wav_preserve_timeline",
+        return_value=mock_preprocessed,
+    ):
+        from transcribeer.diarize import run
+        result = run(wav, backend="resemblyzer", num_speakers=2)
 
     assert len(result) > 0
     for start, end, speaker in result:
@@ -87,3 +92,36 @@ def test_resemblyzer_backend_returns_tuples(tmp_path, monkeypatch):
         assert isinstance(end, float)
         assert isinstance(speaker, str)
         assert speaker.startswith("SPEAKER_")
+
+
+def test_resemblyzer_preprocess_preserves_timeline(tmp_path, monkeypatch):
+    """`_preprocess_wav_preserve_timeline` returns a waveform the same length
+    as the original audio — no VAD-based silence trimming.
+
+    This is the fix for the ``???`` tail-label bug on long recordings: the
+    previous code used ``resemblyzer.preprocess_wav`` which invokes
+    ``trim_long_silences`` and produces a shorter waveform.
+    """
+    import numpy as np
+
+    expected_sr = 16000
+    duration_sec = 5
+    expected_len = expected_sr * duration_sec
+    # Mix real speech-like signal with a long silence block — trim_long_silences
+    # would drop the silence, making the output shorter than the input. The new
+    # helper must NOT do that.
+    speech = np.random.RandomState(0).randn(expected_len // 2).astype(np.float32) * 0.1
+    silence = np.zeros(expected_len // 2, dtype=np.float32)
+    fake_wav = np.concatenate([speech, silence])
+
+    # librosa.load is the only thing we need to mock; normalize_volume is pure
+    # NumPy and runs real.
+    from unittest.mock import patch
+    with patch("librosa.load", return_value=(fake_wav, expected_sr)):
+        from transcribeer.diarize import _preprocess_wav_preserve_timeline
+        out = _preprocess_wav_preserve_timeline(tmp_path / "audio.wav")
+
+    assert len(out) == len(fake_wav), (
+        f"Timeline drift: input was {len(fake_wav)} samples but preprocess "
+        f"returned {len(out)}. The fix must NOT trim silences."
+    )
