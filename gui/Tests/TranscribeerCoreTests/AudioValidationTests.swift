@@ -1,14 +1,15 @@
-import XCTest
+import Foundation
+import Testing
 @testable import TranscribeerCore
 
-/// Tests for `AudioValidation.hasAudibleSignal` — the up-front silent-recording
-/// guard that fires before WhisperKit is loaded.
-final class AudioValidationTests: XCTestCase {
+/// Tests for `AudioValidation.hasAudibleSignal` and the `ensureAudibleSignal`
+/// throw-helper that fires before WhisperKit is loaded.
+struct AudioValidationTests {
     // MARK: - Synthetic WAV helper
 
     /// Build a 16-bit PCM mono WAV at 16 kHz with a 220 Hz sine wave of the
     /// given peak amplitude. `amplitude == 0` yields pure silence.
-    private func makeWAV(
+    private static func makeWAV(
         amplitude: Float,
         durationSec: Double = 5.0,
         sampleRate: UInt32 = 16000
@@ -52,7 +53,7 @@ final class AudioValidationTests: XCTestCase {
         return h + pcm
     }
 
-    private func writeTemp(_ data: Data) throws -> URL {
+    private static func writeTemp(_ data: Data) throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("audio-validation-\(UUID().uuidString).wav")
         try data.write(to: url)
@@ -60,57 +61,65 @@ final class AudioValidationTests: XCTestCase {
     }
 
     // MARK: - Peak-amplitude threshold cases
+    //
+    // Table-driven so the boundary around the 0.001 (~-60 dBFS) threshold is
+    // visible in one place. The whispered case (0.002) is the critical one:
+    // a more aggressive threshold (e.g. 0.005) would false-positive reject
+    // whispered dialogue.
 
-    func testDetectsSilentFile() throws {
-        let url = try writeTemp(makeWAV(amplitude: 0))
+    @Test(
+        "Peak-amplitude threshold at ~-60 dBFS",
+        arguments: [
+            (amplitude: Float(0.0),    expected: false, label: "pure silence / zero samples"),
+            (amplitude: Float(0.3),    expected: true,  label: "normal speech ≈ -10 dBFS"),
+            (amplitude: Float(0.01),   expected: true,  label: "distant-mic speech ≈ -40 dBFS"),
+            (amplitude: Float(0.002),  expected: true,  label: "whispered ≈ -54 dBFS"),
+            (amplitude: Float(0.0005), expected: false, label: "dither-level ≈ -66 dBFS"),
+        ]
+    )
+    func peakThreshold(amplitude: Float, expected: Bool, label: String) throws {
+        let url = try Self.writeTemp(Self.makeWAV(amplitude: amplitude))
         defer { try? FileManager.default.removeItem(at: url) }
-        XCTAssertFalse(try AudioValidation.hasAudibleSignal(at: url))
+        #expect(AudioValidation.hasAudibleSignal(at: url) == expected, "\(label)")
     }
 
-    func testAcceptsNormalSpeechAmplitude() throws {
-        // 0.3 ≈ -10 dBFS — well above any plausible noise floor
-        let url = try writeTemp(makeWAV(amplitude: 0.3))
+    // MARK: - Fallback behavior
+
+    @Test("Unreadable files conservatively return true so the real decoder can surface the format error")
+    func unreadableFileFallsBackToTrue() throws {
+        let url = try Self.writeTemp(Data(repeating: 0x7f, count: 10))
         defer { try? FileManager.default.removeItem(at: url) }
-        XCTAssertTrue(try AudioValidation.hasAudibleSignal(at: url))
+        #expect(AudioValidation.hasAudibleSignal(at: url) == true)
     }
 
-    func testAcceptsQuietSpeech() throws {
-        // 0.01 ≈ -40 dBFS — distant-mic speech
-        let url = try writeTemp(makeWAV(amplitude: 0.01))
+    // MARK: - ensureAudibleSignal throw-helper
+
+    @Test("ensureAudibleSignal throws .silent on a pure-zeros file")
+    func ensureThrowsOnSilent() throws {
+        let url = try Self.writeTemp(Self.makeWAV(amplitude: 0))
         defer { try? FileManager.default.removeItem(at: url) }
-        XCTAssertTrue(try AudioValidation.hasAudibleSignal(at: url))
+        #expect(throws: AudioValidationError.self) {
+            try AudioValidation.ensureAudibleSignal(at: url)
+        }
     }
 
-    func testAcceptsWhisperedSpeech() throws {
-        // 0.002 ≈ -54 dBFS — whispered into a close mic. This is exactly the
-        // case a more aggressive threshold (e.g. 0.005) would have false-
-        // positive rejected.
-        let url = try writeTemp(makeWAV(amplitude: 0.002))
+    @Test("ensureAudibleSignal returns normally for audible recordings")
+    func ensurePassesOnAudible() throws {
+        let url = try Self.writeTemp(Self.makeWAV(amplitude: 0.3))
         defer { try? FileManager.default.removeItem(at: url) }
-        XCTAssertTrue(try AudioValidation.hasAudibleSignal(at: url))
-    }
-
-    func testRejectsDitherLevelNoise() throws {
-        // 0.0005 ≈ -66 dBFS — below the 0.001 default threshold.
-        let url = try writeTemp(makeWAV(amplitude: 0.0005))
-        defer { try? FileManager.default.removeItem(at: url) }
-        XCTAssertFalse(try AudioValidation.hasAudibleSignal(at: url))
-    }
-
-    func testReturnsTrueOnUnreadableFile() throws {
-        // 10 random bytes aren't a valid WAV — AVAudioFile will fail. We
-        // conservatively return true so the real decoder surfaces the error.
-        let url = try writeTemp(Data(repeating: 0x7f, count: 10))
-        defer { try? FileManager.default.removeItem(at: url) }
-        XCTAssertTrue(try AudioValidation.hasAudibleSignal(at: url))
+        // Should not throw.
+        try AudioValidation.ensureAudibleSignal(at: url)
     }
 
     // MARK: - AudioValidationError
 
-    func testErrorDescriptionMentionsFilename() {
+    @Test("errorDescription mentions the filename and reflects the actual probe window")
+    func errorDescriptionReflectsInputs() {
         let url = URL(fileURLWithPath: "/tmp/meeting.m4a")
-        let err = AudioValidationError.silent(url)
-        XCTAssertTrue(err.errorDescription?.contains("meeting.m4a") ?? false)
-        XCTAssertTrue(err.errorDescription?.contains("silent") ?? false)
+        let err = AudioValidationError.silent(url: url, probeSeconds: 45)
+        let message = err.errorDescription ?? ""
+        #expect(message.contains("meeting.m4a"))
+        #expect(message.contains("silent"))
+        #expect(message.contains("45 seconds"))
     }
 }
