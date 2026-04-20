@@ -20,15 +20,16 @@ public enum AudioValidation {
     /// Returns `true` iff the first `probeSeconds` of the file reach a peak
     /// absolute amplitude of at least `peakThreshold`.
     ///
-    /// On unreadable files the check conservatively returns `true` so the
-    /// downstream decoder can surface the real error.
+    /// Conservative fallback: any I/O or allocation failure returns `true` so
+    /// the real decoder downstream can surface the actual format/permission
+    /// error instead of having this guard masquerade as a silent-audio
+    /// problem.
     public static func hasAudibleSignal(
         at url: URL,
         peakThreshold: Float = defaultPeakThreshold,
         probeSeconds: Double = defaultProbeSeconds
-    ) throws -> Bool {
+    ) -> Bool {
         guard let file = try? AVAudioFile(forReading: url) else {
-            // Unreadable — let the real decoder surface the actual problem.
             return true
         }
 
@@ -41,11 +42,15 @@ public enum AudioValidation {
             pcmFormat: file.processingFormat,
             frameCapacity: maxFrames
         ) else {
-            // Can't allocate — conservative: let downstream handle.
             return true
         }
 
-        try file.read(into: buffer, frameCount: maxFrames)
+        do {
+            try file.read(into: buffer, frameCount: maxFrames)
+        } catch {
+            return true
+        }
+
         guard let channels = buffer.floatChannelData, buffer.frameLength > 0 else {
             return false
         }
@@ -54,25 +59,44 @@ public enum AudioValidation {
         let frames = Int(buffer.frameLength)
         for ch in 0..<Int(buffer.format.channelCount) {
             let samples = channels[ch]
-            for i in 0..<frames {
-                let absVal = abs(samples[i])
-                if absVal > peak { peak = absVal }
+            for i in 0..<frames where abs(samples[i]) > peak {
+                peak = abs(samples[i])
             }
         }
         return peak >= peakThreshold
     }
+
+    /// Throws `AudioValidationError.silent` if `hasAudibleSignal` returns
+    /// `false`. Convenience wrapper for pipeline callers that want to abort
+    /// before loading WhisperKit. Keeps the probe-window reported in the
+    /// error message in lock-step with the window actually probed.
+    public static func ensureAudibleSignal(
+        at url: URL,
+        peakThreshold: Float = defaultPeakThreshold,
+        probeSeconds: Double = defaultProbeSeconds
+    ) throws {
+        let audible = hasAudibleSignal(
+            at: url,
+            peakThreshold: peakThreshold,
+            probeSeconds: probeSeconds
+        )
+        if !audible {
+            throw AudioValidationError.silent(url: url, probeSeconds: probeSeconds)
+        }
+    }
 }
 
-/// Surface-level error type callers throw when `hasAudibleSignal` returns
-/// `false` and they want to abort the pipeline with an actionable message.
+/// Surface-level error type for pipeline callers that abort on a failed
+/// audible-signal check.
 public enum AudioValidationError: LocalizedError {
-    case silent(URL)
+    case silent(url: URL, probeSeconds: Double)
 
     public var errorDescription: String? {
         switch self {
-        case .silent(let url):
+        case .silent(let url, let probeSeconds):
+            let seconds = Int(probeSeconds.rounded())
             return """
-                Recording appears silent (no audible signal in first 30 seconds \
+                Recording appears silent (no audible signal in first \(seconds) seconds \
                 of \(url.lastPathComponent)). Common causes:
                   • System-audio capture with nothing playing through speakers.
                   • 'Screen & System Audio Recording' permission revoked mid-session.

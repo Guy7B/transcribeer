@@ -293,9 +293,7 @@ private func transcribeAndFormat(
 ) async throws -> String {
     // Guard: fail fast on silent recordings (e.g. SCStream captured nothing).
     // Saves 5-10 min of wasted WhisperKit CPU on a guaranteed empty transcript.
-    if !(try AudioValidation.hasAudibleSignal(at: audioURL)) {
-        throw AudioValidationError.silent(audioURL)
-    }
+    try AudioValidation.ensureAudibleSignal(at: audioURL)
 
     print("  Loading model \(cfg.whisperModel)…")
     let whisperSegments = try await transcribeAudio(
