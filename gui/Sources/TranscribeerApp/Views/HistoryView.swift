@@ -1,5 +1,7 @@
 import AppKit
 import SwiftUI
+import TranscribeerCore
+import UniformTypeIdentifiers
 
 struct HistoryView: View {
     @Binding var config: AppConfig
@@ -49,11 +51,136 @@ struct HistoryView: View {
         HStack(spacing: 12) {
             stateIndicator
             Spacer()
+            importButton
             primaryActionButton
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
         .background(.regularMaterial)
+    }
+
+    /// Tray-icon next to the primary action — lets users import an existing
+    /// audio file (Voice Memos export, Zoom recording, WhatsApp .m4a, anything
+    /// AVFoundation can decode) as a new session so they can transcribe it
+    /// without re-recording.
+    private var importButton: some View {
+        Button {
+            importAudioFile()
+        } label: {
+            Image(systemName: "square.and.arrow.down")
+                .font(.system(size: 16))
+        }
+        .buttonStyle(.borderless)
+        .controlSize(.large)
+        .help("Import audio file…")
+        .keyboardShortcut("i", modifiers: .command)
+    }
+
+    // MARK: - Import
+
+    /// File-picker flow: pick one or more audio files, copy each into a new
+    /// session directory under `sessions_dir`, name the session from the
+    /// original filename, and select the first imported session in the
+    /// sidebar.
+    private func importAudioFile() {
+        let panel = NSOpenPanel()
+        panel.title = "Import audio file(s)"
+        panel.message = "Select one or more audio recordings to import as sessions."
+        panel.prompt = "Import"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        panel.allowedContentTypes = [.audio, .movie]
+
+        // Default to wherever audio recordings most commonly live on this
+        // Mac: the Voice Memos folder if we can actually read it, else the
+        // Desktop (where exports and manual recordings land). Only a default;
+        // user can navigate anywhere in the picker.
+        panel.directoryURL = defaultImportDirectory()
+
+        // Block until user picks. .OK = chose at least one file.
+        guard panel.runModal() == .OK else { return }
+
+        let urls = panel.urls
+        guard !urls.isEmpty else { return }
+
+        var firstImportedID: String?
+        var imported = 0
+        var failed: [String] = []
+
+        for url in urls {
+            do {
+                let sessionURL = try importSessionFromFile(url: url)
+                if firstImportedID == nil {
+                    firstImportedID = sessionURL.path
+                }
+                imported += 1
+            } catch {
+                failed.append("\(url.lastPathComponent): \(error.localizedDescription)")
+            }
+        }
+
+        refresh()
+        if let firstImportedID {
+            selectedSessionID = firstImportedID
+            loadDetail(sessionID: firstImportedID)
+        }
+
+        if failed.isEmpty {
+            statusText = imported == 1
+                ? "Imported \"\(urls[0].lastPathComponent)\"."
+                : "Imported \(imported) files."
+        } else {
+            statusText = "Imported \(imported); \(failed.count) failed: \(failed.joined(separator: "; "))"
+        }
+    }
+
+    /// Create a new session directory for `url` and copy the file in as
+    /// `audio.<ext>` (normalising m4a/wav names so the rest of the pipeline
+    /// finds it via `SessionManager.audioURL(in:)`). Preserves the original
+    /// filename (minus extension) as the session's display name via meta.json.
+    private func importSessionFromFile(url: URL) throws -> URL {
+        let sessionDir = SessionManager.newSession(sessionsDir: config.expandedSessionsDir)
+        let ext = url.pathExtension.lowercased()
+        // SessionManager.audioURL looks for audio.m4a then audio.wav. For any
+        // other audio type, fall back to .m4a so AVFoundation still picks it
+        // up (it doesn't need the extension to match the container).
+        let targetName = (ext == "m4a" || ext == "wav") ? "audio.\(ext)" : "audio.m4a"
+        let targetURL = sessionDir.appendingPathComponent(targetName)
+        try FileManager.default.copyItem(at: url, to: targetURL)
+
+        // Persist the original filename as the display name.
+        let baseName = url.deletingPathExtension().lastPathComponent
+        if !baseName.isEmpty {
+            SessionManager.setName(sessionDir, baseName)
+        }
+        return sessionDir
+    }
+
+    /// Pick a sensible default starting folder for the import panel. Prefers
+    /// a Voice Memos container we can actually read; falls back to Desktop,
+    /// then Downloads, then the user's home directory. Readability is checked
+    /// via `contentsOfDirectory`, not just existence — the Voice Memos folder
+    /// exists on every Mac but is TCC-gated on modern macOS and `fileExists`
+    /// wrongly reports it as usable.
+    private func defaultImportDirectory() -> URL? {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let candidates: [URL] = [
+            home.appendingPathComponent(
+                "Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings",
+            ),
+            home.appendingPathComponent(
+                "Library/Containers/com.apple.VoiceMemos/Data/Library/Recordings",
+            ),
+            home.appendingPathComponent(
+                "Library/Application Support/com.apple.voicememos/Recordings",
+            ),
+            home.appendingPathComponent("Desktop"),
+            home.appendingPathComponent("Downloads"),
+            home,
+        ]
+        let fm = FileManager.default
+        return candidates.first { (try? fm.contentsOfDirectory(atPath: $0.path)) != nil }
     }
 
     @ViewBuilder
