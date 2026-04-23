@@ -4,6 +4,8 @@ struct SettingsView: View {
     @Binding var config: AppConfig
     @State private var apiKey: String = ""
     @State private var modelCatalog = ModelCatalogService()
+    @State private var apiKeySaveTask: Task<Void, Never>?
+    @State private var pendingAPIKeyBackend: String?
 
     var body: some View {
         TabView {
@@ -24,6 +26,7 @@ struct SettingsView: View {
         .onAppear {
             apiKey = KeychainHelper.getAPIKey(backend: config.llmBackend) ?? ""
         }
+        .onDisappear { flushAPIKeySave() }
     }
 
     // MARK: - Pipeline
@@ -190,6 +193,9 @@ struct SettingsView: View {
                 Picker("Backend", selection: Binding(
                     get: { LLMBackend.from(config.llmBackend) },
                     set: { newBackend in
+                        // Persist any in-flight edit for the previous backend
+                        // before we swap the field out from under the user.
+                        flushAPIKeySave()
                         config.llmBackend = newBackend.rawValue
                         apiKey = KeychainHelper.getAPIKey(backend: newBackend.rawValue) ?? ""
                         save()
@@ -239,11 +245,16 @@ struct SettingsView: View {
             OllamaHostStatus(host: config.ollamaHost)
 
         case .apiKey:
-            SecureField("API key", text: $apiKey)
-                .onSubmit {
-                    guard !apiKey.isEmpty else { return }
-                    KeychainHelper.setAPIKey(backend: backend.rawValue, key: apiKey)
+            // Custom binding so the set-handler only fires on user input —
+            // programmatic loads (onAppear / backend switch) mutate `apiKey`
+            // directly and don't retrigger a save.
+            SecureField("API key", text: Binding(
+                get: { apiKey },
+                set: { newValue in
+                    apiKey = newValue
+                    scheduleAPIKeySave(backend: backend.rawValue, key: newValue)
                 }
+            ))
             APIKeyStatus(backend: backend, keychainKey: apiKey)
 
         case .gcloudADC:
@@ -253,6 +264,35 @@ struct SettingsView: View {
 
     private func save() {
         ConfigManager.save(config)
+    }
+
+    /// Debounced keychain write for the API key. Matches the
+    /// `PromptsSettingsView.scheduleSave` pattern: cancel any pending task,
+    /// wait 400 ms, then persist. Tracks the pending backend so a later
+    /// flush (backend swap / window close) writes to the right account.
+    private func scheduleAPIKeySave(backend: String, key: String) {
+        apiKeySaveTask?.cancel()
+        pendingAPIKeyBackend = backend
+        apiKeySaveTask = Task {
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled else { return }
+            KeychainHelper.setAPIKey(backend: backend, key: key)
+            await MainActor.run {
+                if pendingAPIKeyBackend == backend {
+                    pendingAPIKeyBackend = nil
+                }
+            }
+        }
+    }
+
+    /// Synchronously flush any pending API-key edit. Called on window close
+    /// and before a backend switch so in-flight typing isn't discarded.
+    private func flushAPIKeySave() {
+        guard let backend = pendingAPIKeyBackend else { return }
+        apiKeySaveTask?.cancel()
+        apiKeySaveTask = nil
+        pendingAPIKeyBackend = nil
+        KeychainHelper.setAPIKey(backend: backend, key: apiKey)
     }
 }
 
