@@ -32,12 +32,21 @@ enum SummarizationCatalog {
         "o3-mini",
     ]
 
-    /// Commonly-used Anthropic models.
+    /// Commonly-used Anthropic models, newest first.
+    ///
+    /// The IDs here were verified against Anthropic's `/v1/messages` endpoint
+    /// on 2026-04-23. `claude-sonnet-4-7`, `claude-haiku-4-6`, and
+    /// `claude-haiku-4-7` returned `not_found_error` and are intentionally
+    /// omitted — add them here once Anthropic ships them. The Model field
+    /// in Settings is free-form, so users can always type any ID that isn't
+    /// in this curated list.
     static let anthropicModels = [
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "claude-opus-4-5",
+        "claude-sonnet-4-6",
         "claude-sonnet-4-5",
-        "claude-sonnet-4-20250514",
-        "claude-opus-4-20250514",
-        "claude-3-5-haiku-latest",
+        "claude-haiku-4-5",
     ]
 
     /// Commonly-used Gemini (Vertex) models.
