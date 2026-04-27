@@ -8,11 +8,26 @@ struct HistoryView: View {
     let runner: PipelineRunner
 
     @State private var sessions: [Session] = []
-    @State private var selectedSessionID: String?
+    @State private var selectedSessionIDs: Set<String> = []
     @State private var detail: SessionDetail?
     @State private var searchText = ""
     @State private var profiles: [String] = ["default"]
     @State private var statusText = ""
+    /// Sessions queued for confirmation — either a right-clicked row or the
+    /// entire selection when the user hits Delete with multiple rows selected.
+    /// Drives the confirmation dialog so nothing is deleted in a single click.
+    @State private var sessionsPendingDeletion: [Session] = []
+    /// Tracks the last session whose detail was actually read from disk so
+    /// the `selectedSessionIDs` observer can skip reloads when the effective
+    /// single-selection hasn't changed.
+    @State private var lastLoadedDetailID: String?
+
+    /// Single selection helper — `nil` when zero or multiple rows are selected.
+    /// Used to decide whether to render the detail pane or a multi-select
+    /// placeholder.
+    private var selectedSessionID: String? {
+        selectedSessionIDs.count == 1 ? selectedSessionIDs.first : nil
+    }
 
     /// SwiftUI's canonical way to open the app's Settings scene (macOS 14+).
     /// The older NSApp.sendAction("showSettingsWindow:") path is flaky in
@@ -22,14 +37,17 @@ struct HistoryView: View {
     @Environment(\.openSettings) private var openSettingsEnv
 
     var body: some View {
-        VStack(spacing: 0) {
-            controlBar
-            Divider()
-            NavigationSplitView {
-                sidebar
-            } detail: {
+        NavigationSplitView {
+            sidebar
+        } detail: {
+            VStack(spacing: 0) {
+                accessibilityBanner
+                controlBar
+                Divider()
                 detailPanel
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(minWidth: 800, minHeight: 500)
         .onAppear {
@@ -43,6 +61,43 @@ struct HistoryView: View {
         .onChange(of: runner.state) { _, newState in
             handleStateChange(newState)
         }
+        // When a pipeline run (record → transcribe → summarize, or a
+        // re-transcribe / re-summarize from this view) finishes for the
+        // currently-selected session, reload its detail from disk so the
+        // transcript and summary tabs pick up the freshly-written content
+        // without waiting on a Task continuation. Closes a race where
+        // `transcribingSession` (or `summarizingSession`) flips to nil a
+        // render-tick before the Task that launched the run gets to call
+        // `loadDetail`, leaving the view showing the pre-run text until
+        // the next user action. See tr-9d76.
+        .onChange(of: runner.transcribingSession) { _, newValue in
+            reloadOnPipelineFinish(newValue: newValue)
+        }
+        .onChange(of: runner.summarizingSession) { _, newValue in
+            reloadOnPipelineFinish(newValue: newValue)
+        }
+        .onChange(of: selectedSessionIDs) { _, _ in
+            reloadForSelectionChange()
+        }
+    }
+
+    /// Shared handler for the transcribing/summarizing-session observers.
+    /// Runs the on-disk reload only when the session just transitioned to
+    /// `nil` (the pipeline finished) for the currently selected row.
+    private func reloadOnPipelineFinish(newValue: URL?) {
+        guard newValue == nil, let id = selectedSessionID else { return }
+        loadDetail(sessionID: id)
+        refresh()
+    }
+
+    /// Reload detail for selection changes. Skips the disk read when the
+    /// same session is still selected (sidebar state can churn without the
+    /// active row actually changing — e.g. a transient multi-select that
+    /// collapses back to the original single row).
+    private func reloadForSelectionChange() {
+        let current = selectedSessionID
+        guard current != lastLoadedDetailID else { return }
+        loadDetail(sessionID: current)
     }
 
     // MARK: - Control bar
@@ -53,6 +108,33 @@ struct HistoryView: View {
     // drive the pipeline. The menubar dropdown keeps working exactly as
     // before; this is an additive surface for the same `PipelineRunner`
     // state machine.
+
+    @ViewBuilder
+    private var accessibilityBanner: some View {
+        if config.zoomEnricherEnabled, !AccessibilityGuard.isTrusted {
+            HStack(spacing: 10) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Accessibility permission not granted")
+                        .font(.headline)
+                    Text("Zoom meeting titles and participants won't be captured until Transcribeer is enabled in System Settings → Privacy & Security → Accessibility.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+                Button("Open Settings") {
+                    AccessibilityGuard.prompt()
+                    AccessibilityGuard.openSystemSettings()
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Color.orange.opacity(0.12))
+            .overlay(Rectangle().frame(height: 1).foregroundStyle(.orange.opacity(0.4)), alignment: .bottom)
+        }
+    }
 
     private var controlBar: some View {
         HStack(spacing: 12) {
@@ -81,6 +163,7 @@ struct HistoryView: View {
         .buttonStyle(.borderless)
         .controlSize(.large)
         .help("Import audio file…")
+        .accessibilityLabel("Import audio file")
         .keyboardShortcut("i", modifiers: .command)
     }
 
@@ -99,6 +182,7 @@ struct HistoryView: View {
         .buttonStyle(.borderless)
         .controlSize(.large)
         .help("Settings (⌘,)")
+        .accessibilityLabel("Settings")
         .keyboardShortcut(",", modifiers: .command)
     }
 
@@ -148,7 +232,7 @@ struct HistoryView: View {
 
         refresh()
         if let firstImportedID {
-            selectedSessionID = firstImportedID
+            selectedSessionIDs = [firstImportedID]
             loadDetail(sessionID: firstImportedID)
         }
 
@@ -216,13 +300,33 @@ struct HistoryView: View {
             Label("Ready to record", systemImage: "mic")
                 .foregroundStyle(.secondary)
         case .recording(let startTime):
-            TimelineView(.periodic(from: startTime, by: 1)) { context in
-                let elapsed = Int(context.date.timeIntervalSince(startTime))
-                Label(
-                    "Recording  \(String(format: "%02d:%02d", elapsed / 60, elapsed % 60))",
-                    systemImage: "record.circle.fill",
-                )
-                .foregroundStyle(.red)
+            VStack(alignment: .leading, spacing: 2) {
+                TimelineView(.periodic(from: startTime, by: 1)) { context in
+                    let elapsed = Int(context.date.timeIntervalSince(startTime))
+                    Label(
+                        "Recording  \(String(format: "%02d:%02d", elapsed / 60, elapsed % 60))",
+                        systemImage: "record.circle.fill",
+                    )
+                    .foregroundStyle(.red)
+                }
+                if let title = runner.liveMeetingTitle {
+                    Label(title, systemImage: "video.fill")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                let names = runner.participantsWatcher.snapshot?
+                    .participants
+                    .map(\.displayName)
+                    .filter { !$0.isEmpty } ?? []
+                if !names.isEmpty {
+                    Label(names.joined(separator: ", "), systemImage: "person.2.fill")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .help(names.joined(separator: "\n"))
+                }
             }
         case .transcribing:
             if let pct = runner.transcriptionProgress {
@@ -351,8 +455,8 @@ struct HistoryView: View {
 
         // Auto-select the session the runner is actively working on so the
         // user sees its detail without having to click the new row manually.
-        if let current = runner.currentSession, selectedSessionID != current.path {
-            selectedSessionID = current.path
+        if let current = runner.currentSession, !selectedSessionIDs.contains(current.path) {
+            selectedSessionIDs = [current.path]
             loadDetail(sessionID: current.path)
         }
     }
@@ -360,15 +464,77 @@ struct HistoryView: View {
     // MARK: - Sidebar
 
     private var sidebar: some View {
-        List(filteredSessions, selection: $selectedSessionID) { session in
-            SessionRow(session: session)
+        List(selection: $selectedSessionIDs) {
+            ForEach(groupedSessions, id: \.title) { group in
+                Section(group.title) {
+                    ForEach(group.sessions) { session in
+                        SessionRow(session: session)
+                            .tag(session.id)
+                            .contextMenu {
+                                Button("Reveal in Finder") {
+                                    NSWorkspace.shared.open(session.path)
+                                }
+                                Divider()
+                                Button(deleteMenuTitle(for: session), role: .destructive) {
+                                    sessionsPendingDeletion = deletionTargets(for: session)
+                                }
+                            }
+                    }
+                }
+            }
         }
         .searchable(text: $searchText, prompt: "Search sessions…")
         .navigationTitle("Transcribeer")
         .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 380)
-        .onChange(of: selectedSessionID) { _, newID in
-            loadDetail(sessionID: newID)
+        .onDeleteCommand {
+            let targets = sessions.filter { selectedSessionIDs.contains($0.id) }
+            if !targets.isEmpty { sessionsPendingDeletion = targets }
         }
+        .confirmationDialog(
+            deletionDialogTitle,
+            isPresented: Binding(
+                get: { !sessionsPendingDeletion.isEmpty },
+                set: { if !$0 { sessionsPendingDeletion = [] } },
+            ),
+            titleVisibility: .visible,
+        ) {
+            Button("Move to Trash", role: .destructive) {
+                deleteSessions(sessionsPendingDeletion)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(deletionDialogMessage)
+        }
+    }
+
+    /// When a right-clicked row is part of the current selection and that
+    /// selection includes more than one session, "Delete…" acts on the whole
+    /// selection. Otherwise it targets just the clicked row so users don't get
+    /// surprise bulk deletions when right-clicking an unrelated row.
+    private func deletionTargets(for clicked: Session) -> [Session] {
+        if selectedSessionIDs.contains(clicked.id), selectedSessionIDs.count > 1 {
+            return sessions.filter { selectedSessionIDs.contains($0.id) }
+        }
+        return [clicked]
+    }
+
+    private func deleteMenuTitle(for clicked: Session) -> String {
+        let count = deletionTargets(for: clicked).count
+        return count > 1 ? "Delete \(count) Sessions…" : "Delete…"
+    }
+
+    private var deletionDialogTitle: String {
+        switch sessionsPendingDeletion.count {
+        case 0: return "Delete session?"
+        case 1: return "Delete \"\(sessionsPendingDeletion[0].name)\"?"
+        default: return "Delete \(sessionsPendingDeletion.count) sessions?"
+        }
+    }
+
+    private var deletionDialogMessage: String {
+        sessionsPendingDeletion.count > 1
+            ? "The recordings, transcripts, and summaries will be moved to the Trash."
+            : "The recording, transcript, and summary will be moved to the Trash."
     }
 
     // MARK: - Detail
@@ -392,23 +558,37 @@ struct HistoryView: View {
                 },
                 onTranscribe: { languageOverride in
                     statusText = ""
+                    // Capture the session URL explicitly so the completion
+                    // handler reloads the *right* detail even if
+                    // `selectedSessionID` changes while the transcription is
+                    // running (e.g. user clicks a different sidebar row).
+                    let targetSession = session.path
                     Task {
                         let result = await runner.transcribeSession(
-                            session.path,
+                            targetSession,
                             config: config,
                             languageOverride: languageOverride
                         )
                         statusText = result.ok
                             ? "Transcription done."
                             : "Transcription failed: \(result.error)"
-                        loadDetail(sessionID: selectedSessionID)
+                        // Reload detail here as a backstop — the primary
+                        // refresh is the `onChange(of: runner.transcribingSession)`
+                        // observer above, which fires regardless of whether
+                        // this Task continuation is still on the expected
+                        // session. Idempotent: reading transcript.txt twice
+                        // is cheap.
+                        if selectedSessionID == targetSession.path {
+                            loadDetail(sessionID: targetSession.path)
+                        }
                     }
                 },
                 onSummarize: { request in
                     statusText = "Summarizing…"
+                    let targetSession = session.path
                     Task {
                         let result = await runner.summarizeSession(
-                            session.path,
+                            targetSession,
                             config: config,
                             profile: request.profile,
                             overrides: .init(
@@ -420,15 +600,26 @@ struct HistoryView: View {
                         statusText = result.ok
                             ? "Summary done."
                             : "Summarization failed: \(result.error)"
-                        loadDetail(sessionID: selectedSessionID)
+                        if selectedSessionID == targetSession.path {
+                            loadDetail(sessionID: targetSession.path)
+                        }
                     }
                 },
                 onOpenDir: {
                     NSWorkspace.shared.open(session.path)
                 },
                 onDelete: {
-                    deleteSession(session)
+                    deleteSessions([session])
+                },
+                onSplit: { splitTime in
+                    splitSession(session, at: splitTime)
                 }
+            )
+        } else if selectedSessionIDs.count > 1 {
+            ContentUnavailableView(
+                "\(selectedSessionIDs.count) Recordings Selected",
+                systemImage: "checkmark.circle",
+                description: Text("Press Delete to move all selected recordings to the Trash.")
             )
         } else {
             ContentUnavailableView(
@@ -447,18 +638,33 @@ struct HistoryView: View {
         return sessions.filter { $0.name.lowercased().contains(query) }
     }
 
+    /// Sessions bucketed into Apple Notes–style date groups (Today,
+    /// Yesterday, Previous 7 Days, Previous 30 Days, then by year). Empty
+    /// buckets are omitted so the sidebar doesn't show hollow section
+    /// headers.
+    private var groupedSessions: [SessionGroup] {
+        SessionGrouper.group(filteredSessions, now: Date())
+    }
+
     private var selectedSession: Session? {
         sessions.first { $0.id == selectedSessionID }
     }
 
     private func refresh() {
         sessions = SessionManager.listSessions(sessionsDir: config.expandedSessionsDir)
-        if selectedSessionID == nil, let first = sessions.first {
-            selectedSessionID = first.id
+        if selectedSessionIDs.isEmpty, let first = sessions.first {
+            selectedSessionIDs = [first.id]
+        } else {
+            // Drop selections for sessions that no longer exist (e.g. deleted
+            // from disk) so the detail pane doesn't show stale rows.
+            let existing = Set(sessions.map(\.id))
+            let pruned = selectedSessionIDs.intersection(existing)
+            if pruned != selectedSessionIDs { selectedSessionIDs = pruned }
         }
     }
 
     private func loadDetail(sessionID: String?) {
+        lastLoadedDetailID = sessionID
         guard let sessionID else {
             detail = nil
             return
@@ -466,17 +672,53 @@ struct HistoryView: View {
         detail = SessionManager.sessionDetail(URL(fileURLWithPath: sessionID))
     }
 
-    private func deleteSession(_ session: Session) {
-        guard SessionManager.deleteSession(session.path) else {
-            statusText = "Failed to delete session."
-            return
+    /// Run `SessionSplitter` on `session` and, when it succeeds, refresh the
+    /// sidebar and jump to the freshly created tail session so the user can
+    /// immediately see what was moved out.
+    private func splitSession(_ session: Session, at splitTime: TimeInterval) {
+        statusText = "Splitting recording\u{2026}"
+        Task { @MainActor in
+            do {
+                let new = try await SessionSplitter.split(
+                    session: session.path, at: splitTime, sessionsDir: config.expandedSessionsDir
+                )
+                refresh()
+                selectedSessionIDs = [new.path]
+                loadDetail(sessionID: new.path)
+                statusText = "Split into a new session."
+            } catch {
+                statusText = "Split failed: \(error.localizedDescription)"
+            }
         }
-        statusText = "Session moved to Trash."
-        if selectedSessionID == session.id {
-            selectedSessionID = nil
+    }
+
+    private func deleteSessions(_ targets: [Session]) {
+        var deleted = 0
+        var failed: [String] = []
+        for session in targets {
+            if SessionManager.deleteSession(session.path) {
+                deleted += 1
+                selectedSessionIDs.remove(session.id)
+            } else {
+                failed.append(session.name)
+            }
+        }
+        if deleted > 0, detail != nil, selectedSessionID == nil {
             detail = nil
         }
+        statusText = deletionStatus(deleted: deleted, failed: failed)
         refresh()
+    }
+
+    private func deletionStatus(deleted: Int, failed: [String]) -> String {
+        switch (deleted, failed.count) {
+        case (0, 0): return ""
+        case (_, 0) where deleted == 1: return "Session moved to Trash."
+        case (_, 0): return "\(deleted) sessions moved to Trash."
+        case (0, _): return "Failed to delete: \(failed.joined(separator: ", "))"
+        default:
+            return "\(deleted) deleted; failed: \(failed.joined(separator: ", "))"
+        }
     }
 }
 
@@ -496,23 +738,27 @@ private struct SessionRow: View {
                 artifactIcons
             }
 
-            HStack(spacing: 4) {
-                Text(session.formattedDate)
-                if !session.duration.isEmpty && session.duration != "—" {
-                    Text("·")
-                    Text(session.duration)
+            // Untitled rows lean on the date/time line for identity. Once a
+            // session has a user-given title it shows on line 1, so the
+            // secondary date line becomes redundant noise — drop it and keep
+            // just the language badge (if any).
+            if session.isUntitled || languageBadge != nil {
+                HStack(spacing: 4) {
+                    if session.isUntitled {
+                        Text(SessionDateFormatter.sidebarLine(for: session))
+                    }
+                    if let badge = languageBadge {
+                        Text(badge)
+                            .font(.system(size: 9, weight: .medium))
+                            .tracking(0.5)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Color.secondary.opacity(0.15), in: Capsule())
+                    }
                 }
-                if let badge = languageBadge {
-                    Text(badge)
-                        .font(.system(size: 9, weight: .medium))
-                        .tracking(0.5)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 1)
-                        .background(Color.secondary.opacity(0.15), in: Capsule())
-                }
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
             }
-            .font(.system(size: 11))
-            .foregroundStyle(.secondary)
 
             if !session.snippet.isEmpty {
                 Text(session.snippet)

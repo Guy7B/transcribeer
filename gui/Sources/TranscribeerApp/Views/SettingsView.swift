@@ -11,6 +11,9 @@ struct SettingsView: View {
             Tab("Pipeline", systemImage: "bolt") {
                 pipelineTab
             }
+            Tab("Audio", systemImage: "speaker.wave.2") {
+                AudioSettingsView(config: $config)
+            }
             Tab("Transcription", systemImage: "waveform") {
                 TranscriptionSettingsView(config: $config)
             }
@@ -54,14 +57,65 @@ struct SettingsView: View {
             }
 
             Section {
-                Toggle("Auto-record Zoom meetings", isOn: Binding(
-                    get: { config.zoomAutoRecord },
-                    set: { config.zoomAutoRecord = $0; save() }
+                Toggle("Auto-record meetings", isOn: Binding(
+                    get: { config.meetingAutoRecord },
+                    set: { config.meetingAutoRecord = $0; save() }
                 ))
+                Stepper(
+                    value: Binding(
+                        get: { config.meetingAutoRecordDelay },
+                        set: { config.meetingAutoRecordDelay = max(0, $0); save() }
+                    ),
+                    in: 0...60
+                ) {
+                    HStack {
+                        Text("Countdown before recording")
+                        Spacer()
+                        Text("\(config.meetingAutoRecordDelay)s")
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                }
+                .disabled(!config.meetingAutoRecord)
             } header: {
-                Text("Zoom Integration")
+                Text("Meeting Integration")
             } footer: {
-                Text("Start/stop recording automatically when a Zoom meeting starts/ends.")
+                Text("Start/stop recording automatically when a meeting starts/ends. "
+                    + "Detected from microphone + camera activity paired with a known meeting app "
+                    + "(Zoom, Teams, FaceTime, Webex, Meet, Slack, Discord, WhatsApp, Tuple, Around). "
+                    + "A notification with a cancel button appears during the countdown.")
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Toggle("Enrich Zoom meetings", isOn: Binding(
+                    get: { config.zoomEnricherEnabled },
+                    set: { config.zoomEnricherEnabled = $0; save() },
+                ))
+                Stepper(
+                    value: Binding(
+                        get: { config.maxMeetingParticipants },
+                        set: { config.maxMeetingParticipants = max(0, $0); save() },
+                    ),
+                    in: 0...200,
+                ) {
+                    HStack {
+                        Text("Skip when more than")
+                        Spacer()
+                        Text("\(config.maxMeetingParticipants) participants")
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                }
+                .disabled(!config.zoomEnricherEnabled)
+            } header: {
+                Text("Zoom Enricher")
+            } footer: {
+                Text("Reads the meeting topic and participant list from the Zoom app via "
+                    + "the macOS Accessibility API while a recording is in progress. "
+                    + "Participant names are only captured while you have Zoom's participants "
+                    + "side panel open. Large meetings above the threshold are skipped to keep "
+                    + "the session metadata focused on speakers.")
                     .foregroundStyle(.secondary)
             }
         }

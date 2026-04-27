@@ -22,7 +22,13 @@ struct TranscriptionProgressRow: View {
                 .foregroundStyle(.secondary)
                 .frame(minWidth: 140, alignment: .leading)
 
-            if let progress = runner.transcriptionProgress {
+            if let mic = runner.transcriptionService.micProgress,
+               let sys = runner.transcriptionService.sysProgress {
+                VStack(alignment: .leading, spacing: 4) {
+                    sourceProgressRow(label: "Mic", value: mic)
+                    sourceProgressRow(label: "Sys", value: sys)
+                }
+            } else if let progress = runner.transcriptionProgress {
                 ProgressView(value: progress)
                     .progressViewStyle(.linear)
                 Text("\(Int(progress * 100))%")
@@ -48,6 +54,22 @@ struct TranscriptionProgressRow: View {
         .padding(.vertical, 12)
     }
 
+    /// Single labelled row for a per-source (mic/sys) progress bar.
+    private func sourceProgressRow(label: String, value: Double) -> some View {
+        HStack(spacing: 4) {
+            Text(label)
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .frame(width: 28, alignment: .leading)
+            ProgressView(value: value)
+                .progressViewStyle(.linear)
+            Text("\(Int(value * 100))%")
+                .font(.system(size: 10).monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 28, alignment: .trailing)
+        }
+    }
+
     private var stopButton: some View {
         Button {
             runner.cancelProcessing()
@@ -57,8 +79,9 @@ struct TranscriptionProgressRow: View {
         }
         .buttonStyle(.borderless)
         .controlSize(.small)
-        .help("Stop transcription")
-        .accessibilityLabel("Stop transcription")
+        .disabled(runner.isCancelling)
+        .help(runner.isCancelling ? "Cancelling…" : "Stop transcription")
+        .accessibilityLabel(runner.isCancelling ? "Cancelling" : "Stop transcription")
     }
 
     /// `01:23` while warming up, `01:23 · ~00:45 left` once ETA is stable.
@@ -78,6 +101,7 @@ struct TranscriptionProgressRow: View {
     }
 
     private var progressLabel: String {
+        if runner.isCancelling { return "Cancelling…" }
         if runner.transcriptionProgress != nil { return "Transcribing…" }
         return switch runner.transcriptionService.modelState {
         case .downloading: "Downloading model…"

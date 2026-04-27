@@ -12,8 +12,21 @@ final class PipelineRunner {
     var currentSession: URL?
     var promptProfile: String?
 
-    /// True when the current recording was auto-started by Zoom detection.
-    var zoomAutoStarted = false
+    /// Context captured when meeting detection auto-starts a recording.
+    /// Populated before `startRecording(config:)` is called by the app layer;
+    /// surfaced in the session run log so auto-started sessions can be
+    /// distinguished from manual ones later.
+    struct MeetingAutoStartContext: Equatable {
+        var appName: String
+        var title: String?
+        var delaySeconds: Int
+    }
+
+    /// Non-nil when the current recording was auto-started by meeting detection.
+    var meetingAutoStartContext: MeetingAutoStartContext?
+
+    /// True when the current recording was auto-started by meeting detection.
+    var meetingAutoStarted: Bool { meetingAutoStartContext != nil }
 
     /// Which session is actively being transcribed right now, if any.
     /// Set for both new recordings and re-transcribe-from-history flows so
@@ -26,16 +39,44 @@ final class PipelineRunner {
 
     /// Running accumulator of streamed summary text for `summarizingSession`.
     /// Cleared when the stream finishes or a new summary starts.
-    var liveSummary: String = ""
+    var liveSummary = ""
 
     /// Transcription progress (0..1), driven by WhisperKit.
     var transcriptionProgress: Double? { transcriptionService.progress }
 
+    /// True between a user clicking Stop and the pipeline actually tearing
+    /// down. Drives a "Cancelling…" UI state so the button feels responsive
+    /// even while WhisperKit finishes a non-cancellable CoreML load.
+    var isCancelling = false
+
     let transcriptionService = TranscriptionService()
+
+    /// Observable source of meeting participants scraped from Zoom's UI.
+    /// Kept as a property so the UI layer can read `.snapshot` for live state.
+    /// Started/stopped in lock-step with recording to avoid background AX
+    /// traffic when idle.
+    let participantsWatcher = ZoomParticipantsWatcher()
+
+    /// Latest Zoom meeting topic observed while recording. `nil` when not
+    /// recording, the enricher is disabled, or Zoom has no detectable topic.
+    /// Refreshed every ~2 s by `titlePollTask` so the UI reflects topic edits
+    /// that land mid-call.
+    private(set) var liveMeetingTitle: String?
 
     private var pipelineTask: Task<Void, Never>?
     private var processingTask: Task<Void, Never>?
     private var summarizeTask: Task<CLIResult, Never>?
+    /// Active participants recorder for the current session, `nil` when idle.
+    private var participantsRecorder: SessionParticipantsRecorder?
+    private var titlePollTask: Task<Void, Never>?
+
+    /// Append a timestamped line to the current session's `run.log`. No-op
+    /// when no session is active. Used by the app layer to record events that
+    /// happen outside `runPipeline`, e.g. meeting-driven auto-stop.
+    func appendRunLog(_ message: String) {
+        guard let session = currentSession else { return }
+        SessionLog(logPath: session.appendingPathComponent("run.log")).log(message)
+    }
 
     func startRecording(config: AppConfig) {
         guard !state.isBusy else { return }
@@ -43,11 +84,74 @@ final class PipelineRunner {
         let session = SessionManager.newSession(sessionsDir: config.expandedSessionsDir)
         currentSession = session
         promptProfile = nil
-        state = .recording(startTime: Date())
+        isCancelling = false
+        let startTime = Date()
+        // Persist start time immediately so it’s visible in the sidebar
+        // while the recording is still in progress.
+        SessionManager.setRecordingTimes(session, startedAt: startTime, endedAt: nil)
+        startParticipantsCapture(for: session, config: config)
+        startTitlePolling(config: config)
+        state = .recording(startTime: startTime)
 
         pipelineTask = Task {
-            await runPipeline(session: session, config: config)
+            await runPipeline(session: session, startedAt: startTime, config: config)
         }
+    }
+
+    /// Spin up participant observation for the given session. Started at the
+    /// top of `startRecording` so even the early moments of a meeting are
+    /// captured. Torn down from every path that ends the recording.
+    ///
+    /// No-op when the Zoom enricher is disabled in `config` or when the
+    /// participant cap is set to 0 — avoids background AX polling for users
+    /// who have opted out.
+    private func startParticipantsCapture(for session: URL, config: AppConfig) {
+        guard config.zoomEnricherEnabled, config.maxMeetingParticipants > 0 else {
+            logger.info("zoom enricher disabled (enabled=\(config.zoomEnricherEnabled) cap=\(config.maxMeetingParticipants)) — skipping participant capture")
+            return
+        }
+        participantsWatcher.start()
+        let recorder = SessionParticipantsRecorder(
+            session: session,
+            watcher: participantsWatcher,
+            maxParticipants: config.maxMeetingParticipants,
+        )
+        participantsRecorder = recorder
+        recorder.start()
+    }
+
+    private func stopParticipantsCapture() {
+        participantsRecorder?.stop()
+        participantsRecorder = nil
+        participantsWatcher.stop()
+        stopTitlePolling()
+    }
+
+    /// Poll the Zoom AX topic every 2 s while recording so the UI reflects
+    /// late-arriving topics and mid-call edits. No-op when the Zoom enricher
+    /// is disabled — same contract as `startParticipantsCapture`.
+    ///
+    /// Once a non-nil title is observed it is sticky for the rest of the
+    /// session: later polls that return nil (e.g. the meeting window closed
+    /// before recording stops) do not wipe the UI label.
+    private func startTitlePolling(config: AppConfig) {
+        guard config.zoomEnricherEnabled else { return }
+        titlePollTask?.cancel()
+        titlePollTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                if let title = ZoomTitleReader.meetingTitle() {
+                    self?.liveMeetingTitle = title
+                    return
+                }
+                try? await Task.sleep(for: .seconds(2))
+            }
+        }
+    }
+
+    private func stopTitlePolling() {
+        titlePollTask?.cancel()
+        titlePollTask = nil
+        liveMeetingTitle = nil
     }
 
     func stopRecording() {
@@ -57,9 +161,17 @@ final class PipelineRunner {
 
     /// Cancel an in-flight transcription or summarization. Does nothing while
     /// recording (use `stopRecording` for that).
+    ///
+    /// Cancellation is cooperative: `pipelineTask.cancel()` propagates through
+    /// the structured task tree, and WhisperKit / HubApi check
+    /// `Task.isCancelled` at various checkpoints. The CoreML model compile +
+    /// prewarm step has no cancellation hook, so during that phase the pipeline
+    /// keeps running until it reaches the next checkpoint — we set
+    /// `isCancelling` immediately so the UI can reflect that a stop is pending.
     func cancelProcessing() {
         switch state {
         case .transcribing, .summarizing:
+            isCancelling = true
             transcriptionService.cancel()
             processingTask?.cancel()
             pipelineTask?.cancel()
@@ -70,7 +182,7 @@ final class PipelineRunner {
         }
     }
 
-    private func runPipeline(session: URL, config: AppConfig) async {
+    private func runPipeline(session: URL, startedAt: Date, config: AppConfig) async {
         let audioPath = session.appendingPathComponent("audio.m4a")
         let transcriptPath = session.appendingPathComponent("transcript.txt")
         let summaryPath = session.appendingPathComponent("summary.md")
@@ -82,23 +194,49 @@ final class PipelineRunner {
             "backend=\(config.transcriptionBackend) model=\(modelForBackend(config: config)) " +
             "llm_backend=\(config.llmBackend) llm_model=\(config.llmModel)",
         )
+        for line in CaptureService.describeDevices(audio: config.audio) {
+            logger.log(line)
+        }
+        if let ctx = meetingAutoStartContext {
+            let titlePart = ctx.title.map { "title=\"\($0)\"" } ?? "title=<none>"
+            logger.log(
+                "start=auto meeting.app=\(ctx.appName) \(titlePart) delay=\(ctx.delaySeconds)s"
+            )
+        } else {
+            logger.log("start=manual")
+        }
 
         // 1. Record — in-process via CaptureCore (uses app's TCC permission)
         logger.log("capture started")
-        let recordResult = await CaptureService.record(to: audioPath, duration: nil)
+        let recordResult = await CaptureService.record(
+            to: session,
+            duration: nil,
+            audio: config.audio
+        )
 
         switch recordResult {
         case .permissionDenied(let detail):
-            logger.log("capture failed: \(detail)")
-            state = .error(message: detail, sessionPath: session.path, kind: .recording)
-            NotificationManager.notifyError(detail)
+            stopParticipantsCapture()
+            reportFailure(
+                logMessage: "capture failed: \(detail)",
+                userFacing: detail,
+                session: session,
+                kind: .recording,
+                logger: logger,
+            )
             return
         case .error(let err):
-            logger.log("capture failed: \(err)")
-            state = .error(message: err, sessionPath: session.path, kind: .recording)
-            NotificationManager.notifyError(err)
+            stopParticipantsCapture()
+            reportFailure(
+                logMessage: "capture failed: \(err)",
+                userFacing: err,
+                session: session,
+                kind: .recording,
+                logger: logger,
+            )
             return
         case .noAudio:
+            stopParticipantsCapture()
             logger.log("no audio captured")
             state = .idle
             return
@@ -108,6 +246,9 @@ final class PipelineRunner {
             )[.size] as? UInt64) ?? 0
             let sizeMB = Double(size) / (1024.0 * 1024.0)
             logger.log("recorded \(size) bytes (\(String(format: "%.2f", sizeMB)) MB)")
+            // Stamp the wall-clock end of the capture so the sidebar can
+            // show a "10:30 – 11:15" range for calendar correlation.
+            SessionManager.setRecordingTimes(session, startedAt: startedAt, endedAt: Date())
         }
 
         if config.pipelineMode == "record-only" {
@@ -118,7 +259,7 @@ final class PipelineRunner {
         // 2. Transcribe (WhisperKit + SpeakerKit)
         guard await performTranscription(
             config: config,
-            audioPath: audioPath,
+            session: session,
             transcriptPath: transcriptPath,
             logger: logger
         ) else { return }
@@ -139,19 +280,32 @@ final class PipelineRunner {
         finishSession(session)
     }
 
+    /// Log a failure message, flip state to `.error`, and post a user notification.
+    private func reportFailure(
+        logMessage: String,
+        userFacing: String,
+        session: URL,
+        kind: AppState.ErrorKind,
+        logger: SessionLog
+    ) {
+        logger.log(logMessage)
+        state = .error(message: userFacing, sessionPath: session.path, kind: kind)
+        NotificationManager.notifyError(userFacing)
+    }
+
     private func performTranscription(
         config: AppConfig,
-        audioPath: URL,
+        session: URL,
         transcriptPath: URL,
         logger: SessionLog
     ) async -> Bool {
         state = .transcribing
-        let session = transcriptPath.deletingLastPathComponent()
         transcribingSession = session
         defer { transcribingSession = nil }
         logger.log("transcription started")
         let started = Date()
 
+        let audioPath = session.appendingPathComponent("audio.m4a")
         do {
             let result = try await transcribeAndFormat(
                 audioPath: audioPath,
@@ -165,19 +319,27 @@ final class PipelineRunner {
                 config: config,
                 language: config.language,
             )
+            try result.write(to: transcriptPath, atomically: true, encoding: .utf8)
             SessionManager.setLanguage(session, config.language)
             let elapsed = Date().timeIntervalSince(started)
             logger.log("transcription done in \(String(format: "%.1f", elapsed))s")
             return true
         } catch is CancellationError {
             logger.log("transcription cancelled")
+            stopParticipantsCapture()
+            isCancelling = false
             state = .idle
             return false
         } catch {
+            stopParticipantsCapture()
             let message = "Transcription failed: \(error.localizedDescription)"
-            logger.log(message)
-            state = .error(message: message, sessionPath: session.path, kind: .transcription)
-            NotificationManager.notifyError(message)
+            reportFailure(
+                logMessage: message,
+                userFacing: message,
+                session: session,
+                kind: .transcription,
+                logger: logger,
+            )
             return false
         }
     }
@@ -331,6 +493,7 @@ final class PipelineRunner {
     }
 
     private func finishSession(_ session: URL) {
+        stopParticipantsCapture()
         state = .done(sessionPath: session.path)
         NotificationManager.notifyDone(sessionName: SessionManager.displayName(session))
     }
@@ -459,36 +622,42 @@ final class PipelineRunner {
             return CLIResult(ok: false, error: "Audio file not found")
         }
         let language = languageOverride ?? config.language
+        var cfg = config
+        cfg.language = language
+        let txPath = session.appendingPathComponent("transcript.txt")
 
-        logger.info("re-transcribe: \(audioPath.path) lang=\(language)")
+        logger.info("re-transcribe: \(session.path) lang=\(cfg.language)")
 
         let previousState = state
         state = .transcribing
         transcribingSession = session
+        isCancelling = false
         defer {
             transcribingSession = nil
+            isCancelling = false
             if case .transcribing = state { state = previousState }
         }
 
         let runLog = SessionLog(logPath: session.appendingPathComponent("run.log"))
         runLog.log(
-            "re-transcribe started backend=\(config.transcriptionBackend) " +
-            "model=\(modelForBackend(config: config)) lang=\(language)",
+            "re-transcribe started backend=\(cfg.transcriptionBackend) " +
+            "model=\(modelForBackend(config: cfg)) lang=\(language)",
         )
         let started = Date()
         do {
             let result = try await transcribeAndFormat(
                 audioPath: audioPath,
                 language: language,
-                config: config,
+                config: cfg,
                 logger: runLog,
             )
             try storeTranscript(
                 result: result,
                 session: session,
-                config: config,
+                config: cfg,
                 language: language,
             )
+            try result.write(to: txPath, atomically: true, encoding: .utf8)
             SessionManager.setLanguage(session, language)
             let elapsed = Date().timeIntervalSince(started)
             runLog.log("re-transcribe done in \(String(format: "%.1f", elapsed))s")
@@ -552,6 +721,7 @@ final class PipelineRunner {
 
         let previousState = state
         state = .summarizing
+        isCancelling = false
 
         // Run inside a stored Task so `cancelProcessing` can tear it down
         // mid-stream — the caller's Task isn't reachable from the runner.
@@ -578,6 +748,7 @@ final class PipelineRunner {
         summarizeTask = work
         let result = await work.value
         summarizeTask = nil
+        isCancelling = false
         if case .summarizing = state { state = previousState }
 
         if !result.ok, result.error == "Cancelled" {
@@ -593,12 +764,8 @@ final class PipelineRunner {
     /// preferences aren't mutated by a one-off regenerate.
     private func applyOverrides(_ overrides: SummarizeOverrides, to config: AppConfig) -> AppConfig {
         var copy = config
-        if let backend = overrides.backend, !backend.isEmpty {
-            copy.llmBackend = backend
-        }
-        if let model = overrides.model, !model.isEmpty {
-            copy.llmModel = model
-        }
+        if let backend = overrides.backend, !backend.isEmpty { copy.llmBackend = backend }
+        if let model = overrides.model, !model.isEmpty { copy.llmModel = model }
         return copy
     }
 

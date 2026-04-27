@@ -1,17 +1,15 @@
+import AVFoundation
 import Foundation
 import os.log
 
 private let logger = Logger(subsystem: "com.transcribeer", category: "audio.chunker")
 
-/// Splits a WAV audio file into fixed-duration chunk files.
+/// Splits an audio file (WAV, CAF, M4A — anything `AVAudioFile` can read) into
+/// fixed-duration 16-bit PCM mono WAV chunks.
 ///
-/// Handles any PCM WAV the standard RIFF spec allows — not just the
-/// minimal "classic" layout where `fmt ` is at offset 12 and PCM data
-/// starts at offset 44. AVFoundation, for instance, inserts a `JUNK`
-/// alignment chunk before `fmt `, and both AVFoundation and `afconvert`
-/// emit extended `fmt ` chunks (40 bytes, WAVE_FORMAT_EXTENSIBLE) rather
-/// than the 16-byte PCM default. The chunk walker below finds `fmt ` and
-/// `data` regardless of their order or the presence of other chunks.
+/// Uses `AVAudioFile` for decoding so the source format doesn't matter; chunks
+/// are always emitted as standard RIFF PCM WAV so `WhisperKit` (and any other
+/// downstream consumer) can load them without format-specific branches.
 public enum AudioChunker {
     public struct Chunk {
         /// URL of the chunk WAV file on disk.
@@ -20,28 +18,17 @@ public enum AudioChunker {
         public let startOffset: Double
     }
 
-    /// Parsed WAV structure — just the parts we care about for slicing.
-    private struct WAVLayout {
-        let sampleRate: UInt32
-        let numChannels: UInt16
-        let bitsPerSample: UInt16
-        /// Byte range of PCM data within the full file.
-        let dataRange: Range<Int>
-    }
-
-    /// Returns the playback duration in seconds of a WAV file, or nil if unreadable.
+    /// Playback duration in seconds for any format `AVAudioFile` can open.
+    /// Returns `nil` on I/O failure or unreadable header (including truncated
+    /// WAVs that never made it past the 44-byte header).
     public static func wavDuration(url: URL) -> Double? {
-        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe),
-              let layout = try? parseWAV(data)
-        else { return nil }
-        let bytesPerSec = Double(layout.sampleRate)
-            * Double(layout.numChannels)
-            * Double(layout.bitsPerSample) / 8
-        guard bytesPerSec > 0 else { return nil }
-        return Double(layout.dataRange.count) / bytesPerSec
+        guard let file = try? AVAudioFile(forReading: url) else { return nil }
+        let rate = file.processingFormat.sampleRate
+        guard rate > 0 else { return nil }
+        return Double(file.length) / rate
     }
 
-    /// Split `source` WAV into chunks of `chunkDuration` seconds.
+    /// Split `source` into chunks of `chunkDuration` seconds.
     ///
     /// Returns chunks in chronological order. Files are written to `tempDir`.
     /// Caller is responsible for deleting `tempDir` when done.
@@ -51,21 +38,26 @@ public enum AudioChunker {
         tempDir: URL
     ) throws -> [Chunk] {
         let started = Date()
-        let data = try Data(contentsOf: source, options: .mappedIfSafe)
-        let layout = try parseWAV(data)
-
-        let frameSize = Int(layout.numChannels) * Int(layout.bitsPerSample / 8)
-        let pcm = data.subdata(in: layout.dataRange)
-
-        guard frameSize > 0, !pcm.isEmpty else { return [] }
-
-        let samplesPerChunk = Int(Double(layout.sampleRate) * chunkDuration)
-        let bytesPerChunk   = samplesPerChunk * frameSize
+        let file = try AVAudioFile(forReading: source)
+        let sourceFormat = file.processingFormat
+        let sourceRate = sourceFormat.sampleRate
+        guard sourceRate > 0, file.length > 0 else { return [] }
 
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
 
-        let totalSamples = pcm.count / frameSize
-        let totalDuration = Double(totalSamples) / Double(layout.sampleRate)
+        let framesPerChunk = AVAudioFrameCount(max(1, Int64(chunkDuration * sourceRate)))
+        guard let readBuffer = AVAudioPCMBuffer(
+            pcmFormat: sourceFormat,
+            frameCapacity: framesPerChunk
+        ) else {
+            throw ChunkError.invalidWAV
+        }
+
+        // WhisperKit decodes from WAV, so emit at the source's native sample
+        // rate but downmixed to mono 16-bit. Resampling is left to WhisperKit
+        // to avoid introducing quality loss here.
+        let outputRate = UInt32(sourceRate)
+        let totalDuration = Double(file.length) / sourceRate
         let estimatedCount = max(1, Int((totalDuration / chunkDuration).rounded(.up)))
         logger.info(
             """
@@ -73,37 +65,49 @@ public enum AudioChunker {
             duration=\(String(format: "%.1f", totalDuration), privacy: .public)s \
             chunkDuration=\(chunkDuration, privacy: .public)s \
             chunks=~\(estimatedCount, privacy: .public) \
-            sampleRate=\(layout.sampleRate, privacy: .public) \
+            sampleRate=\(sourceRate, privacy: .public) \
             outDir=\(tempDir.path, privacy: .public)
             """,
         )
 
         var chunks: [Chunk] = []
-        var byteOffset = 0
         var chunkIndex = 0
+        var startFrame: AVAudioFramePosition = 0
 
-        while byteOffset < pcm.count {
-            let end      = min(byteOffset + bytesPerChunk, pcm.count)
-            let chunkPCM = pcm.subdata(in: byteOffset..<end)
+        while startFrame < file.length {
+            file.framePosition = startFrame
+            let remaining = file.length - startFrame
+            let toRead = AVAudioFrameCount(min(Int64(framesPerChunk), remaining))
+
+            readBuffer.frameLength = 0
+            try file.read(into: readBuffer, frameCount: toRead)
+            guard readBuffer.frameLength > 0 else { break }
+
+            let pcm = pcmMonoInt16(from: readBuffer)
             let chunkURL = tempDir.appendingPathComponent("chunk-\(chunkIndex).wav")
-
             try writeWAV(
-                pcm: chunkPCM,
+                pcm: pcm,
                 to: chunkURL,
-                sampleRate: layout.sampleRate,
-                numChannels: layout.numChannels,
-                bitsPerSample: layout.bitsPerSample
+                sampleRate: outputRate,
+                numChannels: 1,
+                bitsPerSample: 16
             )
 
-            let startOffset = Double(byteOffset / frameSize) / Double(layout.sampleRate)
-            let chunkSeconds = Double(chunkPCM.count / frameSize) / Double(layout.sampleRate)
-            let durationStr = String(format: "%.1f", chunkSeconds)
+            let startOffset = Double(startFrame) / sourceRate
+            let chunkSeconds = Double(readBuffer.frameLength) / sourceRate
             logger.debug(
-                "chunk idx=\(chunkIndex, privacy: .public) bytes=\(chunkPCM.count, privacy: .public) duration=\(durationStr, privacy: .public)s",
+                """
+                chunk idx=\(chunkIndex, privacy: .public) \
+                frames=\(readBuffer.frameLength, privacy: .public) \
+                duration=\(String(format: "%.1f", chunkSeconds), privacy: .public)s
+                """,
             )
-            chunks.append(Chunk(url: chunkURL, startOffset: startOffset))
+            chunks.append(Chunk(
+                url: chunkURL,
+                startOffset: startOffset
+            ))
 
-            byteOffset = end
+            startFrame += AVAudioFramePosition(readBuffer.frameLength)
             chunkIndex += 1
         }
 
@@ -113,59 +117,49 @@ public enum AudioChunker {
         return chunks
     }
 
-    // MARK: - WAV parsing
+    // MARK: - Private
 
-    /// Walk the RIFF chunk list to locate `fmt ` and `data`, whatever
-    /// order they appear in and regardless of extra chunks (JUNK, LIST,
-    /// bext, etc.). Throws `.invalidWAV` if the magic numbers or chunks
-    /// don't line up.
-    private static func parseWAV(_ data: Data) throws -> WAVLayout {
-        guard data.count >= 12,
-              data[0..<4] == Data([0x52, 0x49, 0x46, 0x46]), // "RIFF"
-              data[8..<12] == Data([0x57, 0x41, 0x56, 0x45]) // "WAVE"
-        else { throw ChunkError.invalidWAV }
+    /// Downmix an N-channel float PCM buffer to mono Int16 PCM bytes.
+    ///
+    /// Works for both interleaved and deinterleaved buffers; falls back to a
+    /// zero-filled buffer only if `AVAudioPCMBuffer` didn't expose channel
+    /// data (e.g. a zero-length read).
+    private static func pcmMonoInt16(from buffer: AVAudioPCMBuffer) -> Data {
+        let frames = Int(buffer.frameLength)
+        guard frames > 0 else { return Data() }
+        var samples = [Int16](repeating: 0, count: frames)
+        let channelCount = Int(buffer.format.channelCount)
 
-        var cursor = 12
-        var sampleRate: UInt32 = 0
-        var numChannels: UInt16 = 0
-        var bitsPerSample: UInt16 = 0
-        var dataRange: Range<Int>?
-
-        while cursor + 8 <= data.count {
-            let chunkID = data.subdata(in: cursor..<(cursor + 4))
-            let chunkSize = Int(data.readUInt32LE(at: cursor + 4))
-            let bodyStart = cursor + 8
-            let bodyEnd = bodyStart + chunkSize
-            guard bodyEnd <= data.count else { break }
-
-            if chunkID == Data([0x66, 0x6d, 0x74, 0x20]) { // "fmt "
-                guard chunkSize >= 16 else { throw ChunkError.invalidWAV }
-                // PCM fields live at fixed offsets within the fmt body,
-                // identical for classic (16-byte) and extensible (40-byte)
-                // formats.
-                numChannels = data.readUInt16LE(at: bodyStart + 2)
-                sampleRate = data.readUInt32LE(at: bodyStart + 4)
-                bitsPerSample = data.readUInt16LE(at: bodyStart + 14)
-            } else if chunkID == Data([0x64, 0x61, 0x74, 0x61]) { // "data"
-                dataRange = bodyStart..<bodyEnd
+        if let channels = buffer.floatChannelData {
+            for i in 0..<frames {
+                var sum: Float = 0
+                for ch in 0..<channelCount {
+                    sum += channels[ch][i]
+                }
+                samples[i] = floatToInt16(sum / Float(max(channelCount, 1)))
             }
-
-            // Chunks are 2-byte aligned; an odd chunkSize has a pad byte.
-            cursor = bodyEnd + (chunkSize % 2)
+        } else if let interleaved = buffer.int16ChannelData {
+            let src = interleaved[0]
+            for i in 0..<frames {
+                var sum: Int32 = 0
+                for ch in 0..<channelCount {
+                    sum += Int32(src[i * channelCount + ch])
+                }
+                samples[i] = Int16(clamping: sum / Int32(max(channelCount, 1)))
+            }
         }
 
-        guard let dataRange, sampleRate > 0, numChannels > 0, bitsPerSample > 0 else {
-            throw ChunkError.invalidWAV
+        return samples.withUnsafeBufferPointer { buf in
+            guard let base = buf.baseAddress else { return Data() }
+            return Data(bytes: base, count: frames * MemoryLayout<Int16>.size)
         }
-        return WAVLayout(
-            sampleRate: sampleRate,
-            numChannels: numChannels,
-            bitsPerSample: bitsPerSample,
-            dataRange: dataRange,
-        )
     }
 
-    // MARK: - Private
+    private static func floatToInt16(_ value: Float) -> Int16 {
+        let clamped = max(-1.0, min(1.0, value))
+        let scaled = clamped * Float(Int16.max)
+        return Int16(scaled.rounded())
+    }
 
     private static func writeWAV(
         pcm: Data,
@@ -176,7 +170,7 @@ public enum AudioChunker {
     ) throws {
         let dataSize   = UInt32(pcm.count)
         let byteRate   = sampleRate * UInt32(numChannels) * UInt32(bitsPerSample) / 8
-        let blockAlign = numChannels * (bitsPerSample / 8)
+        let blockAlign = UInt16(Int(numChannels) * Int(bitsPerSample) / 8)
 
         var h = Data(count: 44)
         h[0...3]   = Data([0x52, 0x49, 0x46, 0x46])
@@ -203,29 +197,9 @@ public enum ChunkError: Error {
     case invalidWAV
 }
 
-// MARK: - Data read/write helpers
+// MARK: - Data write helpers
 
 private extension Data {
-    func readUInt32LE(at offset: Int) -> UInt32 {
-        guard offset + 4 <= count else { return 0 }
-        return withUnsafeBytes { ptr in
-            guard let base = ptr.baseAddress else { return UInt32(0) }
-            var v: UInt32 = 0
-            memcpy(&v, base.advanced(by: offset), 4)
-            return UInt32(littleEndian: v)
-        }
-    }
-
-    func readUInt16LE(at offset: Int) -> UInt16 {
-        guard offset + 2 <= count else { return 0 }
-        return withUnsafeBytes { ptr in
-            guard let base = ptr.baseAddress else { return UInt16(0) }
-            var v: UInt16 = 0
-            memcpy(&v, base.advanced(by: offset), 2)
-            return UInt16(littleEndian: v)
-        }
-    }
-
     mutating func writeUInt32LE(_ value: UInt32, at offset: Int) {
         var le = value.littleEndian
         Swift.withUnsafeBytes(of: &le) { replaceSubrange(offset..<(offset + 4), with: $0) }

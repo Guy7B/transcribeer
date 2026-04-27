@@ -17,6 +17,7 @@ struct SessionDetailView: View {
     let onSummarize: (SummaryRequest) -> Void
     let onOpenDir: () -> Void
     let onDelete: () -> Void
+    let onSplit: (TimeInterval) -> Void
 
     /// Everything the detail view wants to override for a single regenerate:
     /// prompt profile, model, and one-shot "focus on X" instructions. A nil
@@ -70,7 +71,11 @@ struct SessionDetailView: View {
             }
 
             if let audioURL = detail.audioURL {
-                AudioPlayerView(audioURL: audioURL, vm: playerVM)
+                AudioPlayerView(
+                    audioURL: audioURL,
+                    vm: playerVM,
+                    onSplit: onSplit
+                )
             }
 
             Divider()
@@ -99,16 +104,19 @@ struct SessionDetailView: View {
                     Button("Delete Session…", role: .destructive) {
                         showDeleteConfirm = true
                     }
+                    .keyboardShortcut(.delete, modifiers: .command)
                 } label: {
                     Image(systemName: "ellipsis.circle")
                 }
                 .menuStyle(.borderlessButton)
                 .help("More actions")
+                .accessibilityLabel("More actions")
 
                 Button(action: onOpenDir) {
                     Image(systemName: "folder")
                 }
                 .help("Reveal in Finder")
+                .accessibilityLabel("Reveal in Finder")
             }
         }
         .overlay(alignment: .bottom) { statusToast }
@@ -201,6 +209,10 @@ struct SessionDetailView: View {
             Text(detail.date + (detail.duration.isEmpty ? "" : " · \(detail.duration)"))
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
+
+            if !detail.participants.isEmpty {
+                SessionParticipantsRow(participants: detail.participants)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 20)
@@ -365,6 +377,7 @@ struct SessionDetailView: View {
                 onSeek: { playerVM.seek(to: $0) },
                 playheadTime: playerVM.hasAudio ? playerVM.currentTime : nil,
                 isStreaming: isTranscribingThisSession,
+                otherLabel: config.audio.otherLabel
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
@@ -373,9 +386,9 @@ struct SessionDetailView: View {
     /// Lines to render in the transcript tab.
     ///
     /// While WhisperKit is actively transcribing *this* session, show the live
-    /// segments streamed via `segmentDiscoveryCallback` (diarization hasn't
-    /// run yet, so speaker is left blank). Otherwise parse the on-disk
-    /// transcript — that's the canonical store.
+    /// segments. For dual-source transcription the speaker label is already
+    /// known (self / other); for legacy single-file it shows "…" until the
+    /// diarization pass completes.
     private var transcriptLines: [TranscriptLine] {
         if isTranscribingThisSession {
             let segments = runner.transcriptionService.liveSegments
@@ -385,7 +398,7 @@ struct SessionDetailView: View {
                     id: idx,
                     start: seg.start,
                     end: seg.end,
-                    speaker: "…",
+                    speaker: seg.speaker.isEmpty ? "…" : seg.speaker,
                     text: TranscriptFormatter.sanitize(seg.text),
                 )
             }

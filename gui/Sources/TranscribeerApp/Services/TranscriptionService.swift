@@ -1,3 +1,4 @@
+import CaptureCore
 import Foundation
 import WhisperKit
 import TranscribeerCore
@@ -7,6 +8,14 @@ struct TranscriptSegment: Sendable {
     let start: Double // seconds
     let end: Double
     let text: String
+    let speaker: String
+
+    init(start: Double, end: Double, text: String, speaker: String = "") {
+        self.start = start
+        self.end = end
+        self.text = text
+        self.speaker = speaker
+    }
 }
 
 /// Wraps WhisperKit for in-process speech-to-text transcription.
@@ -18,6 +27,12 @@ struct TranscriptSegment: Sendable {
 final class TranscriptionService {
     /// Current transcription progress (nil when idle).
     var progress: Double?
+
+    /// Progress for the mic source in a dual-source transcription.
+    var micProgress: Double?
+
+    /// Progress for the system-audio source in a dual-source transcription.
+    var sysProgress: Double?
 
     /// Current state of the loaded model.
     var modelState: ModelState = .unloaded
@@ -34,6 +49,7 @@ final class TranscriptionService {
 
     /// The currently running transcription. Stored so the caller can cancel it.
     private var activeTask: Task<[TranscriptSegment], Error>?
+    private var dualTask: Task<[TranscribeerCore.LabeledSegment], Error>?
 
     private static let modelsDir: URL = {
         let home = FileManager.default.homeDirectoryForCurrentUser
@@ -135,6 +151,104 @@ final class TranscriptionService {
             fileManager.fileExists(atPath: folder.appendingPathComponent(name).path)
         }
         return allPresent ? folder : nil
+    }
+
+    /// Transcribe a session directory, choosing dual-source or legacy path
+    /// automatically based on which files exist.
+    ///
+    /// - Returns: Formatted transcript text.
+    func transcribe(session: URL, config: AppConfig) async throws -> String {
+        let timingURL = session.appendingPathComponent("timing.json")
+        let timing: DualSourceTranscriber.TimingInfo
+        if FileManager.default.fileExists(atPath: timingURL.path) {
+            let metadata = try TimingMetadata.read(from: timingURL)
+            timing = .init(
+                micStartEpoch: metadata.micStartEpoch,
+                sysStartEpoch: metadata.sysStartEpoch
+            )
+        } else {
+            timing = .init(micStartEpoch: nil, sysStartEpoch: nil)
+        }
+
+        var coreCfg = TranscribeerCore.AppConfig()
+        coreCfg.language = config.language
+        coreCfg.whisperModel = config.whisperModel
+        coreCfg.whisperModelRepo = config.whisperModelRepo
+        coreCfg.diarization = config.diarization
+        coreCfg.numSpeakers = config.numSpeakers
+        coreCfg.audio.selfLabel = config.audio.selfLabel
+        coreCfg.audio.otherLabel = config.audio.otherLabel
+
+        progress = 0
+        micProgress = 0
+        sysProgress = 0
+        liveSegments = []
+
+        let task = Task.detached(priority: .userInitiated) { () -> [TranscribeerCore.LabeledSegment] in
+            try Task.checkCancellation()
+            let segments = try await DualSourceTranscriber.transcribe(
+                session: session,
+                cfg: coreCfg,
+                timing: timing,
+                onMicProgress: { value in
+                    Task { @MainActor in
+                        guard self.micProgress != value else { return }
+                        self.micProgress = value
+                        self.updateCombinedProgress()
+                    }
+                },
+                onSysProgress: { value in
+                    Task { @MainActor in
+                        guard self.sysProgress != value else { return }
+                        self.sysProgress = value
+                        self.updateCombinedProgress()
+                    }
+                }
+            )
+            return segments
+        }
+        dualTask = task
+
+        defer {
+            progress = nil
+            micProgress = nil
+            sysProgress = nil
+            dualTask = nil
+        }
+
+        let segments = try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
+
+        liveSegments = segments.map { seg in
+            TranscriptSegment(
+                start: seg.start,
+                end: seg.end,
+                text: seg.text,
+                speaker: seg.speaker
+            )
+        }
+
+        let appSegments = segments.map { seg in
+            LabeledSegment(
+                start: seg.start,
+                end: seg.end,
+                speaker: seg.speaker,
+                text: seg.text
+            )
+        }
+        return TranscriptFormatter.formatDual(appSegments)
+    }
+
+    private func updateCombinedProgress() {
+        switch (micProgress, sysProgress) {
+        case (nil, nil):                   progress = nil
+        case let (mic?, nil):              progress = mic
+        case let (nil, sys?):              progress = sys
+        case let (mic?, sys?):             progress = (mic + sys) / 2
+        }
     }
 
     /// Transcribe an audio file to timestamped segments.
@@ -248,6 +362,7 @@ final class TranscriptionService {
     /// `CancellationError`.
     func cancel() {
         activeTask?.cancel()
+        dualTask?.cancel()
     }
 
     /// Unload the current model and free memory.
@@ -260,6 +375,8 @@ final class TranscriptionService {
         loadedModelName = nil
         loadedModelRepo = nil
         progress = nil
+        micProgress = nil
+        sysProgress = nil
         liveSegments = []
     }
 }

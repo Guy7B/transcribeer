@@ -22,6 +22,11 @@ struct TranscriptView: View {
     /// text is arriving. Used during live transcription.
     let isStreaming: Bool
 
+    /// The label used for the "other" participant (system audio). Rendered
+    /// with a fixed distinct color so it doesn't collide with the hash-based
+    /// palette used for diarized speakers.
+    let otherLabel: String?
+
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
@@ -31,6 +36,7 @@ struct TranscriptView: View {
                             line: line,
                             isActive: isActive(line),
                             onSeek: onSeek,
+                            otherLabel: otherLabel
                         )
                         .id(line.id)
                     }
@@ -74,6 +80,7 @@ private struct TranscriptRow: View {
     let line: TranscriptLine
     let isActive: Bool
     let onSeek: (Double) -> Void
+    let otherLabel: String?
 
     private var isRTL: Bool { TextDirection.isRightToLeft(line.text) }
     private var direction: LayoutDirection { isRTL ? .rightToLeft : .leftToRight }
@@ -135,22 +142,40 @@ private struct TranscriptRow: View {
 
     private func formatTimestamp(_ seconds: Double) -> String {
         let total = Int(seconds)
-        let h = total / 3600
-        let m = (total % 3600) / 60
-        let s = total % 60
-        if h > 0 {
-            return String(format: "%d:%02d:%02d", h, m, s)
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        let secs = total % 60
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, secs)
         }
-        return String(format: "%d:%02d", m, s)
+        return String(format: "%d:%02d", minutes, secs)
     }
 
     /// Stable speaker → color mapping. `Speaker 1`, `Speaker 2`, ... get
-    /// distinct accents; `???` (unknown) stays muted.
+    /// distinct accents; `???` (unknown) stays muted; the configured
+    /// `otherLabel` (e.g. "Them") gets a fixed distinct color.
+    ///
+    /// Uses a deterministic djb2 hash over unicode scalars rather than
+    /// `String.hashValue` — Swift seeds its hasher per process, so
+    /// `hashValue` produces different numbers each launch and would flip
+    /// speaker colors between app runs.
     private func speakerColor(for speaker: String) -> Color {
         guard speaker != "???" else { return .secondary }
+        if let otherLabel, speaker == otherLabel {
+            return .red
+        }
         let palette: [Color] = [.blue, .purple, .teal, .orange, .pink, .indigo, .green]
-        let hash = abs(speaker.hashValue)
-        return palette[hash % palette.count]
+        return palette[Self.stableHash(speaker) % palette.count]
+    }
+
+    /// djb2: deterministic across launches. UInt so arithmetic wraps cleanly
+    /// without overflow.
+    private static func stableHash(_ string: String) -> Int {
+        var hash: UInt = 5381
+        for scalar in string.unicodeScalars {
+            hash = hash &* 33 &+ UInt(scalar.value)
+        }
+        return Int(hash & UInt(Int.max))
     }
 }
 
