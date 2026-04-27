@@ -1,7 +1,17 @@
 import Foundation
+import os.log
+
+private let logger = Logger(subsystem: "com.transcribeer", category: "audio.chunker")
 
 /// Splits a WAV audio file into fixed-duration chunk files.
-/// Reads actual header fields so it works with any PCM WAV (not just 16kHz/mono/16-bit).
+///
+/// Handles any PCM WAV the standard RIFF spec allows — not just the
+/// minimal "classic" layout where `fmt ` is at offset 12 and PCM data
+/// starts at offset 44. AVFoundation, for instance, inserts a `JUNK`
+/// alignment chunk before `fmt `, and both AVFoundation and `afconvert`
+/// emit extended `fmt ` chunks (40 bytes, WAVE_FORMAT_EXTENSIBLE) rather
+/// than the 16-byte PCM default. The chunk walker below finds `fmt ` and
+/// `data` regardless of their order or the presence of other chunks.
 public enum AudioChunker {
     public struct Chunk {
         /// URL of the chunk WAV file on disk.
@@ -10,17 +20,25 @@ public enum AudioChunker {
         public let startOffset: Double
     }
 
+    /// Parsed WAV structure — just the parts we care about for slicing.
+    private struct WAVLayout {
+        let sampleRate: UInt32
+        let numChannels: UInt16
+        let bitsPerSample: UInt16
+        /// Byte range of PCM data within the full file.
+        let dataRange: Range<Int>
+    }
+
     /// Returns the playback duration in seconds of a WAV file, or nil if unreadable.
     public static func wavDuration(url: URL) -> Double? {
         guard let data = try? Data(contentsOf: url, options: .mappedIfSafe),
-              data.count >= 44 else { return nil }
-        let dataBytes   = Double(data.readUInt32LE(at: 40))
-        let sampleRate  = Double(data.readUInt32LE(at: 24))
-        let numChannels = Double(data.readUInt16LE(at: 22))
-        let bitsPerSample = Double(data.readUInt16LE(at: 34))
-        let bytesPerSec = sampleRate * numChannels * bitsPerSample / 8
+              let layout = try? parseWAV(data)
+        else { return nil }
+        let bytesPerSec = Double(layout.sampleRate)
+            * Double(layout.numChannels)
+            * Double(layout.bitsPerSample) / 8
         guard bytesPerSec > 0 else { return nil }
-        return dataBytes / bytesPerSec
+        return Double(layout.dataRange.count) / bytesPerSec
     }
 
     /// Split `source` WAV into chunks of `chunkDuration` seconds.
@@ -32,21 +50,33 @@ public enum AudioChunker {
         chunkDuration: Double = 600,
         tempDir: URL
     ) throws -> [Chunk] {
+        let started = Date()
         let data = try Data(contentsOf: source, options: .mappedIfSafe)
-        guard data.count >= 44 else { throw ChunkError.invalidWAV }
+        let layout = try parseWAV(data)
 
-        let sampleRate    = data.readUInt32LE(at: 24)
-        let numChannels   = data.readUInt16LE(at: 22)
-        let bitsPerSample = data.readUInt16LE(at: 34)
-        let frameSize     = Int(numChannels) * Int(bitsPerSample / 8)
-        let pcm           = data.subdata(in: 44..<data.count)
+        let frameSize = Int(layout.numChannels) * Int(layout.bitsPerSample / 8)
+        let pcm = data.subdata(in: layout.dataRange)
 
         guard frameSize > 0, !pcm.isEmpty else { return [] }
 
-        let samplesPerChunk = Int(Double(sampleRate) * chunkDuration)
+        let samplesPerChunk = Int(Double(layout.sampleRate) * chunkDuration)
         let bytesPerChunk   = samplesPerChunk * frameSize
 
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+
+        let totalSamples = pcm.count / frameSize
+        let totalDuration = Double(totalSamples) / Double(layout.sampleRate)
+        let estimatedCount = max(1, Int((totalDuration / chunkDuration).rounded(.up)))
+        logger.info(
+            """
+            split src=\(source.lastPathComponent, privacy: .public) \
+            duration=\(String(format: "%.1f", totalDuration), privacy: .public)s \
+            chunkDuration=\(chunkDuration, privacy: .public)s \
+            chunks=~\(estimatedCount, privacy: .public) \
+            sampleRate=\(layout.sampleRate, privacy: .public) \
+            outDir=\(tempDir.path, privacy: .public)
+            """,
+        )
 
         var chunks: [Chunk] = []
         var byteOffset = 0
@@ -60,19 +90,79 @@ public enum AudioChunker {
             try writeWAV(
                 pcm: chunkPCM,
                 to: chunkURL,
-                sampleRate: sampleRate,
-                numChannels: numChannels,
-                bitsPerSample: bitsPerSample
+                sampleRate: layout.sampleRate,
+                numChannels: layout.numChannels,
+                bitsPerSample: layout.bitsPerSample
             )
 
-            let startOffset = Double(byteOffset / frameSize) / Double(sampleRate)
+            let startOffset = Double(byteOffset / frameSize) / Double(layout.sampleRate)
+            let chunkSeconds = Double(chunkPCM.count / frameSize) / Double(layout.sampleRate)
+            let durationStr = String(format: "%.1f", chunkSeconds)
+            logger.debug(
+                "chunk idx=\(chunkIndex, privacy: .public) bytes=\(chunkPCM.count, privacy: .public) duration=\(durationStr, privacy: .public)s",
+            )
             chunks.append(Chunk(url: chunkURL, startOffset: startOffset))
 
             byteOffset = end
             chunkIndex += 1
         }
 
+        let elapsed = Date().timeIntervalSince(started)
+        let elapsedStr = String(format: "%.2f", elapsed)
+        logger.info("split done count=\(chunks.count, privacy: .public) in \(elapsedStr, privacy: .public)s")
         return chunks
+    }
+
+    // MARK: - WAV parsing
+
+    /// Walk the RIFF chunk list to locate `fmt ` and `data`, whatever
+    /// order they appear in and regardless of extra chunks (JUNK, LIST,
+    /// bext, etc.). Throws `.invalidWAV` if the magic numbers or chunks
+    /// don't line up.
+    private static func parseWAV(_ data: Data) throws -> WAVLayout {
+        guard data.count >= 12,
+              data[0..<4] == Data([0x52, 0x49, 0x46, 0x46]), // "RIFF"
+              data[8..<12] == Data([0x57, 0x41, 0x56, 0x45]) // "WAVE"
+        else { throw ChunkError.invalidWAV }
+
+        var cursor = 12
+        var sampleRate: UInt32 = 0
+        var numChannels: UInt16 = 0
+        var bitsPerSample: UInt16 = 0
+        var dataRange: Range<Int>?
+
+        while cursor + 8 <= data.count {
+            let chunkID = data.subdata(in: cursor..<(cursor + 4))
+            let chunkSize = Int(data.readUInt32LE(at: cursor + 4))
+            let bodyStart = cursor + 8
+            let bodyEnd = bodyStart + chunkSize
+            guard bodyEnd <= data.count else { break }
+
+            if chunkID == Data([0x66, 0x6d, 0x74, 0x20]) { // "fmt "
+                guard chunkSize >= 16 else { throw ChunkError.invalidWAV }
+                // PCM fields live at fixed offsets within the fmt body,
+                // identical for classic (16-byte) and extensible (40-byte)
+                // formats.
+                numChannels = data.readUInt16LE(at: bodyStart + 2)
+                sampleRate = data.readUInt32LE(at: bodyStart + 4)
+                bitsPerSample = data.readUInt16LE(at: bodyStart + 14)
+            } else if chunkID == Data([0x64, 0x61, 0x74, 0x61]) { // "data"
+                dataRange = bodyStart..<bodyEnd
+            }
+
+            // Chunks are 2-byte aligned; an odd chunkSize has a pad byte.
+            cursor = bodyEnd + (chunkSize % 2)
+        }
+
+        guard let dataRange, sampleRate > 0, numChannels > 0, bitsPerSample > 0 else {
+            throw ChunkError.invalidWAV
+        }
+        return WAVLayout(
+            sampleRate: sampleRate,
+            numChannels: numChannels,
+            bitsPerSample: bitsPerSample,
+            dataRange: dataRange,
+        )
     }
 
     // MARK: - Private

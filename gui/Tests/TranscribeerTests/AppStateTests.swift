@@ -12,7 +12,7 @@ struct AppStateTests {
               (.transcribing, false),
               (.summarizing, false),
               (.done(sessionPath: "/tmp"), false),
-              (.error("fail"), false),
+              (.error(message: "fail", sessionPath: nil, kind: .other), false),
           ])
     func isRecording(state: AppState, expected: Bool) {
         #expect(state.isRecording == expected)
@@ -27,7 +27,7 @@ struct AppStateTests {
               (.transcribing, true),
               (.summarizing, true),
               (.done(sessionPath: "/tmp"), false),
-              (.error("fail"), false),
+              (.error(message: "fail", sessionPath: nil, kind: .other), false),
           ])
     func isBusy(state: AppState, expected: Bool) {
         #expect(state.isBusy == expected)
@@ -58,7 +58,8 @@ struct AppStateTests {
     @Test("Error includes the message")
     func errorStatusText() {
         let msg = "Something went wrong"
-        #expect(AppState.error(msg).statusText == "⚠ \(msg)")
+        let state = AppState.error(message: msg, sessionPath: nil, kind: .transcription)
+        #expect(state.statusText == "⚠ \(msg)")
     }
 
     @Test("Recording status includes elapsed time format")
@@ -67,5 +68,34 @@ struct AppStateTests {
         let text = AppState.recording(startTime: past).statusText
         #expect(text.hasPrefix("⏺ Recording"))
         #expect(text.contains("02:0"))
+    }
+
+    // MARK: - Error payload accessors
+
+    @Test("errorMessage returns the message only for .error states")
+    func errorMessageAccessor() {
+        let err: AppState = .error(message: "boom", sessionPath: "/tmp/s", kind: .transcription)
+        #expect(err.errorMessage == "boom")
+        #expect(AppState.idle.errorMessage == nil)
+    }
+
+    @Test("errorSessionPath round-trips the attached session URL")
+    func errorSessionPathAccessor() {
+        let err: AppState = .error(message: "boom", sessionPath: "/tmp/s", kind: .transcription)
+        #expect(err.errorSessionPath == "/tmp/s")
+        let bare: AppState = .error(message: "boom", sessionPath: nil, kind: .other)
+        #expect(bare.errorSessionPath == nil)
+    }
+
+    @Test("errorKind reports the categorised stage that failed",
+          arguments: [
+              (AppState.ErrorKind.transcription, AppState.ErrorKind.transcription),
+              (.recording, .recording),
+              (.summarization, .summarization),
+              (.other, .other),
+          ])
+    func errorKindAccessor(input: AppState.ErrorKind, expected: AppState.ErrorKind) {
+        let state: AppState = .error(message: "x", sessionPath: nil, kind: input)
+        #expect(state.errorKind == expected)
     }
 }

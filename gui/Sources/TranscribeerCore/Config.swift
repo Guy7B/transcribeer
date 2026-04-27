@@ -3,10 +3,17 @@ import TOMLDecoder
 
 public struct AppConfig: Equatable, Sendable {
     public var language: String = "auto"
+    public var transcriptionBackend: String = "whisperkit"
     public var whisperModel: String = "openai_whisper-large-v3_turbo"
     public var whisperModelRepo: String = ""
     public var diarization: String = "pyannote"
     public var numSpeakers: Int = 0
+    public var googleSttLocation: String = "global"
+    public var googleSttModel: String = "default"
+    public var googleSttDiarize: Bool = true
+    public var googleSttV2Project: String = ""
+    public var googleSttV2Region: String = "us"
+    public var googleSttV2Model: String = "chirp_3"
     public var llmBackend: String = "ollama"
     public var llmModel: String = "llama3"
     public var ollamaHost: String = "http://localhost:11434"
@@ -62,11 +69,19 @@ private struct PipelineSection: Decodable {
 }
 
 private struct TranscriptionSection: Decodable {
+    var backend: String?
     var language: String?
     var model: String?
     var model_repo: String?
     var diarization: String?
     var num_speakers: Int?
+    var google_stt_location: String?
+    var google_stt_model: String?
+    // swiftlint:disable:next discouraged_optional_boolean
+    var google_stt_diarize: Bool?
+    var google_stt_v2_project: String?
+    var google_stt_v2_region: String?
+    var google_stt_v2_model: String?
 }
 
 private struct SummarizationSection: Decodable {
@@ -107,11 +122,18 @@ public enum ConfigManager {
     }
 
     private static func applyTranscription(_ section: TranscriptionSection, to cfg: inout AppConfig) {
+        if let v = section.backend { cfg.transcriptionBackend = v }
         if let v = section.language { cfg.language = v }
         if let v = section.model { cfg.whisperModel = v }
         if let v = section.model_repo { cfg.whisperModelRepo = v }
         if let v = section.diarization { cfg.diarization = v }
         if let v = section.num_speakers { cfg.numSpeakers = v }
+        if let v = section.google_stt_location { cfg.googleSttLocation = v }
+        if let v = section.google_stt_model { cfg.googleSttModel = v }
+        if let v = section.google_stt_diarize { cfg.googleSttDiarize = v }
+        if let v = section.google_stt_v2_project { cfg.googleSttV2Project = v }
+        if let v = section.google_stt_v2_region { cfg.googleSttV2Region = v }
+        if let v = section.google_stt_v2_model { cfg.googleSttV2Model = v }
     }
 
     private static func applySummarization(_ section: SummarizationSection, to cfg: inout AppConfig) {
@@ -136,11 +158,18 @@ public enum ConfigManager {
         zoom_auto_record = \(cfg.zoomAutoRecord)
 
         [transcription]
+        backend = "\(cfg.transcriptionBackend)"
         language = "\(cfg.language)"
         model = "\(cfg.whisperModel)"
         model_repo = "\(cfg.whisperModelRepo)"
         diarization = "\(cfg.diarization)"
         num_speakers = \(cfg.numSpeakers)
+        google_stt_location = "\(cfg.googleSttLocation)"
+        google_stt_model = "\(cfg.googleSttModel)"
+        google_stt_diarize = \(cfg.googleSttDiarize)
+        google_stt_v2_project = "\(cfg.googleSttV2Project)"
+        google_stt_v2_region = "\(cfg.googleSttV2Region)"
+        google_stt_v2_model = "\(cfg.googleSttV2Model)"
 
         [summarization]
         backend = "\(cfg.llmBackend)"

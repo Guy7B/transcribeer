@@ -42,6 +42,13 @@ struct SessionDetailView: View {
     @State private var showDeleteConfirm = false
     @State private var statusClearTask: Task<Void, Never>?
     @State private var summaryStartedAt: Date?
+    /// Last error scraped from this session's run.log. `nil` means the
+    /// log doesn't exist or doesn't contain a recognised failure marker.
+    /// Refreshed on session change.
+    @State private var lastSessionError: String?
+    /// Lets the user dismiss the failure banner without re-running. Reset
+    /// on every session switch so a stale dismissal doesn't carry across.
+    @State private var failureBannerDismissed = false
     /// Shared audio player VM. Owned here so the transcript rows can seek
     /// the same player instance the `AudioPlayerView` drives.
     @State private var playerVM = AudioPlayerVM()
@@ -57,6 +64,10 @@ struct SessionDetailView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
+
+            if let error = lastSessionError, !failureBannerDismissed {
+                failureBanner(message: error)
+            }
 
             if let audioURL = detail.audioURL {
                 AudioPlayerView(audioURL: audioURL, vm: playerVM)
@@ -147,6 +158,8 @@ struct SessionDetailView: View {
         summaryFocus = ""
         selectedSummaryModel = defaultSummaryModel
         syncLanguage()
+        lastSessionError = RunLogReader.lastError(in: session.path)
+        failureBannerDismissed = false
     }
 
     private var defaultSummaryModel: SummaryModelOption {
@@ -408,6 +421,81 @@ struct SessionDetailView: View {
             .italic()
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .padding(20)
+    }
+
+    // MARK: - Failure banner
+
+    /// Sticky banner shown above the audio player when the session's last
+    /// transcription run failed. Surfaces three actions inline so the user
+    /// can investigate (Open log), recover (Retry), or browse the session
+    /// folder (Reveal in Finder) without leaving the detail view.
+    @ViewBuilder
+    private func failureBanner(message: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .font(.system(size: 14, weight: .semibold))
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Last transcription failed")
+                    .font(.system(size: 12, weight: .semibold))
+                Text(message)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+                HStack(spacing: 12) {
+                    Button("Open log") {
+                        RunLogReader.openRunLog(in: session.path)
+                    }
+                    Button("Retry") {
+                        retryTranscription()
+                    }
+                    Button("Reveal in Finder") {
+                        RunLogReader.revealInFinder(session.path)
+                    }
+                }
+                .buttonStyle(.borderless)
+                .controlSize(.small)
+                .tint(.secondary)
+                .padding(.top, 2)
+            }
+            Spacer(minLength: 8)
+            Button {
+                failureBannerDismissed = true
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.borderless)
+            .help("Dismiss")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(Color.orange.opacity(0.08))
+        .overlay(
+            Rectangle()
+                .frame(height: 1)
+                .foregroundStyle(Color.orange.opacity(0.25)),
+            alignment: .bottom,
+        )
+    }
+
+    /// Kick off a retry against the runner. Hides the banner immediately
+    /// so the user gets visual confirmation that something happened, then
+    /// re-reads the log when the retry completes so a second failure
+    /// shows the new message rather than the stale one.
+    private func retryTranscription() {
+        failureBannerDismissed = true
+        statusText = "Retrying transcription…"
+        Task {
+            let result = await runner.retryTranscription(session.path, config: config)
+            statusText = result.ok
+                ? "Transcription done."
+                : "Transcription failed: \(result.error)"
+            lastSessionError = RunLogReader.lastError(in: session.path)
+            failureBannerDismissed = result.ok
+        }
     }
 
     // MARK: - Status toast

@@ -159,14 +159,23 @@ gui: build-dev
 # ── side-by-side dev variant ──────────────────────────────────────────────────
 # Rebuilds the main bundle first (so binary + capture-bin + icon are fresh),
 # then copies it to Transcribeer-dev.app and rewrites the Info.plist to use a
-# distinct bundle id and display name. Ad-hoc re-signed because any Info.plist
-# change invalidates the bundle's existing signature.
+# distinct bundle id and display name.
 #
 # The resulting bundle can run at the same time as a normally-installed
 # Transcribeer: the two have different bundle ids, so macOS treats them as
 # separate applications in the menu bar, the Dock, and the app switcher.
 # MenuBarIcon detects the .dev suffix at runtime and overlays an orange "D"
 # badge so the two menu bar icons are visually distinguishable.
+#
+# Signing identity: prefer the "Transcribeer Dev" local self-signed identity
+# (see docs/dev-signing.md or the code-signing section in README) so the
+# bundle's code requirement stays stable across rebuilds and the TCC grants
+# for Screen Recording / Microphone persist. If that identity isn't present
+# in the login keychain, fall back to ad-hoc signing — then expect every
+# `make build-dev-variant` to invalidate prior TCC approvals.
+DEV_SIGN_IDENTITY := $(shell security find-identity -v -p codesigning 2>/dev/null | \
+  awk -F'"' '/"Transcribeer Dev"/ { print $$2; exit }')
+
 build-dev-variant: build-dev
 	@rm -rf $(DEV_VARIANT_BUNDLE)
 	@cp -R $(APP_BUNDLE) $(DEV_VARIANT_BUNDLE)
@@ -183,7 +192,14 @@ build-dev-variant: build-dev
 	@# reviewers can find and use the window UI without fighting the menubar.
 	@/usr/libexec/PlistBuddy -c "Delete :LSUIElement" \
 	  $(DEV_VARIANT_BUNDLE)/Contents/Info.plist 2>/dev/null || true
-	@codesign --force --deep --sign - $(DEV_VARIANT_BUNDLE) >/dev/null 2>&1
+	@if [ -n "$(DEV_SIGN_IDENTITY)" ]; then \
+	  codesign --force --deep --sign "$(DEV_SIGN_IDENTITY)" $(DEV_VARIANT_BUNDLE) >/dev/null 2>&1 && \
+	  echo "✓ signed with stable identity: $(DEV_SIGN_IDENTITY)"; \
+	else \
+	  codesign --force --deep --sign - $(DEV_VARIANT_BUNDLE) >/dev/null 2>&1 && \
+	  echo "⚠ ad-hoc signed (TCC grants will be wiped on next rebuild)"; \
+	  echo "  set up a stable identity: see docs/dev-signing section"; \
+	fi
 	@echo "✓ dev variant: $(DEV_VARIANT_BUNDLE)"
 	@echo "  bundle id: $(DEV_VARIANT_BUNDLE_ID) — runs alongside a main install"
 

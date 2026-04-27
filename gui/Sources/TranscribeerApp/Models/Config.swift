@@ -4,10 +4,40 @@ import TOMLDecoder
 /// Mirrors ~/.transcribeer/config.toml.
 struct AppConfig: Equatable {
     var language: String = "auto"
+    var transcriptionBackend: String = "whisperkit"
     var whisperModel: String = "openai_whisper-large-v3_turbo"
     var whisperModelRepo: String = ""
     var diarization: String = "pyannote"
     var numSpeakers: Int = 0
+    /// Google Speech-to-Text v2 `recognizer` location. `"global"` works for
+    /// non-EU-residency users; EU users should set `"eu"`. Only consulted
+    /// when `transcriptionBackend == "google_stt"` and we later move to v2.
+    var googleSttLocation: String = "global"
+    /// Google STT v1 model. `"default"` is the safest choice: it's the only
+    /// v1 model Google currently enables for Hebrew (probed 2026-04-23).
+    /// `"latest_long"` gives better English accuracy but rejects `he-IL`
+    /// server-side with `"model is not supported for language : iw-IL"`.
+    var googleSttModel: String = "default"
+    /// When true and the v1 Google backend is active, request inline
+    /// diarization and skip the external Pyannote pass. Ignored for v2:
+    /// Chirp 3 doesn't support Hebrew diarization so we always run Pyannote
+    /// externally. Regardless of this flag, the pipeline auto-disables
+    /// Google diarization for Hebrew because its v1 diarization is broken
+    /// there (see `PipelineRunner.makeTranscriptionBackend`).
+    var googleSttDiarize: Bool = true
+    /// GCP project ID for Google STT v2 (Chirp). Required when
+    /// `transcriptionBackend == "google_stt_v2"`. Stored in config (not
+    /// Keychain) because it's not secret — the bearer token is the secret
+    /// and that comes from `gcloud`.
+    var googleSttV2Project: String = ""
+    /// Regional endpoint for v2. Chirp 3 lives in `"us"` and `"eu"` multi-
+    /// regions; Chirp 2 uses single regions like `"us-central1"`. Default
+    /// matches Chirp 3.
+    var googleSttV2Region: String = "us"
+    /// v2 model. `chirp_3` handles Hebrew best; `chirp_2` and `latest_long`
+    /// exist for other languages. Users can type any valid model ID into
+    /// config.toml.
+    var googleSttV2Model: String = "chirp_3"
     var llmBackend: String = "ollama"
     var llmModel: String = "llama3"
     var ollamaHost: String = "http://localhost:11434"
@@ -53,11 +83,18 @@ private struct PipelineSection: Decodable {
 }
 
 private struct TranscriptionSection: Decodable {
+    var backend: String?
     var language: String?
     var model: String?
     var model_repo: String?
     var diarization: String?
     var num_speakers: Int?
+    var google_stt_location: String?
+    var google_stt_model: String?
+    var google_stt_diarize: Bool?
+    var google_stt_v2_project: String?
+    var google_stt_v2_region: String?
+    var google_stt_v2_model: String?
 }
 
 private struct SummarizationSection: Decodable {
@@ -113,11 +150,18 @@ enum ConfigManager {
             cfg.zoomAutoRecord = pipeline.zoom_auto_record ?? cfg.zoomAutoRecord
         }
         if let transcription = toml.transcription {
+            cfg.transcriptionBackend = transcription.backend ?? cfg.transcriptionBackend
             cfg.language = transcription.language ?? cfg.language
             cfg.whisperModel = transcription.model.map(AppConfig.canonicalWhisperModel) ?? cfg.whisperModel
             cfg.whisperModelRepo = transcription.model_repo ?? cfg.whisperModelRepo
             cfg.diarization = transcription.diarization ?? cfg.diarization
             cfg.numSpeakers = transcription.num_speakers ?? cfg.numSpeakers
+            cfg.googleSttLocation = transcription.google_stt_location ?? cfg.googleSttLocation
+            cfg.googleSttModel = transcription.google_stt_model ?? cfg.googleSttModel
+            cfg.googleSttDiarize = transcription.google_stt_diarize ?? cfg.googleSttDiarize
+            cfg.googleSttV2Project = transcription.google_stt_v2_project ?? cfg.googleSttV2Project
+            cfg.googleSttV2Region = transcription.google_stt_v2_region ?? cfg.googleSttV2Region
+            cfg.googleSttV2Model = transcription.google_stt_v2_model ?? cfg.googleSttV2Model
         }
         if let summarization = toml.summarization {
             cfg.llmBackend = summarization.backend ?? cfg.llmBackend
@@ -143,11 +187,18 @@ enum ConfigManager {
         zoom_auto_record = \(cfg.zoomAutoRecord)
 
         [transcription]
+        backend = "\(cfg.transcriptionBackend)"
         language = "\(cfg.language)"
         model = "\(cfg.whisperModel)"
         model_repo = "\(cfg.whisperModelRepo)"
         diarization = "\(cfg.diarization)"
         num_speakers = \(speakers)
+        google_stt_location = "\(cfg.googleSttLocation)"
+        google_stt_model = "\(cfg.googleSttModel)"
+        google_stt_diarize = \(cfg.googleSttDiarize)
+        google_stt_v2_project = "\(cfg.googleSttV2Project)"
+        google_stt_v2_region = "\(cfg.googleSttV2Region)"
+        google_stt_v2_model = "\(cfg.googleSttV2Model)"
 
         [summarization]
         backend = "\(cfg.llmBackend)"

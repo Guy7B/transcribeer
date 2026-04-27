@@ -1,5 +1,8 @@
 import Foundation
 import LLM
+import os.log
+
+private let logger = Logger(subsystem: "com.transcribeer", category: "summarization")
 
 /// Summarizes transcripts via OpenAI, Anthropic, Gemini (Vertex AI), or Ollama.
 enum SummarizationService {
@@ -47,6 +50,17 @@ enum SummarizationService {
             inference: .direct,
             model: .init(rawValue: resolvedModel)
         )
+        let promptCount = (prompt ?? defaultPrompt).count
+        let transcriptCount = transcript.count
+        logger.info(
+            """
+            stream start backend=\(backend, privacy: .public) \
+            model=\(resolvedModel, privacy: .public) \
+            transcriptChars=\(transcriptCount, privacy: .public) \
+            promptChars=\(promptCount, privacy: .public)
+            """,
+        )
+        let started = Date()
         let source = await llm.streamConversation(
             systemPrompt: prompt ?? defaultPrompt,
             userMessage: transcript,
@@ -54,14 +68,34 @@ enum SummarizationService {
         )
         return AsyncThrowingStream { continuation in
             let task = Task {
+                var totalChars = 0
+                var sawFirst = false
                 do {
                     for try await event in source {
                         if case let .textDelta(fragment) = event, !fragment.isEmpty {
+                            if !sawFirst {
+                                sawFirst = true
+                                let ttft = Date().timeIntervalSince(started)
+                                let ttftStr = String(format: "%.2f", ttft)
+                                logger.info("first fragment in \(ttftStr, privacy: .public)s")
+                            }
+                            totalChars += fragment.count
                             continuation.yield(fragment)
                         }
                     }
+                    let elapsed = Date().timeIntervalSince(started)
+                    let elapsedStr = String(format: "%.2f", elapsed)
+                    logger.info(
+                        """
+                        stream end totalChars=\(totalChars, privacy: .public) \
+                        elapsed=\(elapsedStr, privacy: .public)s
+                        """,
+                    )
                     continuation.finish()
                 } catch {
+                    logger.error(
+                        "stream error: \(error.localizedDescription, privacy: .public)",
+                    )
                     continuation.finish(throwing: error)
                 }
             }

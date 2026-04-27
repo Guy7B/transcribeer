@@ -52,5 +52,13 @@ let package = Package(
             path: "Tests/TranscribeerCoreTests",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
+        // Swift Testing suite for TranscribeerApp internals. Pure-logic only —
+        // no UI automation, no network (per AGENTS.md).
+        .testTarget(
+            name: "TranscribeerTests",
+            dependencies: ["TranscribeerApp", "TranscribeerCore"],
+            path: "Tests/TranscribeerTests",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
     ]
 )

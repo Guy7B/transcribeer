@@ -85,8 +85,8 @@ struct TranscribeerApp: App {
                 startRecording(autoStarted: false)
             }
 
-        case .error(let msg):
-            Text("⚠ \(msg)")
+        case let .error(message, _, _):
+            Text(verbatim: "⚠ \(message)")
             Divider()
             Button("Start Recording") {
                 startRecording(autoStarted: false)

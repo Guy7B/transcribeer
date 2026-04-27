@@ -1,9 +1,12 @@
 // swift-tools-version: 6.0
 import PackageDescription
 
-// Tiny CLI used by the e2e harness to transcribe a WAV with the same
-// WhisperKit model Transcribeer uses by default. Keeping it in a separate
-// package avoids a test-only dependency on the GUI target.
+// Tiny CLIs used by the e2e harness and STT-comparison benchmark. Keeping them
+// in a separate package avoids test-only dependencies on the GUI target.
+//
+// Tools built from this package:
+//   - transcribe-cli : WhisperKit transcription (text or JSON with timestamps)
+//   - diarize-cli    : SpeakerKit (Pyannote) diarization → JSON speaker segments
 let package = Package(
     name: "TranscribeCLI",
     platforms: [.macOS(.v15)],
@@ -17,6 +20,15 @@ let package = Package(
                 .product(name: "WhisperKit", package: "WhisperKit"),
             ],
             path: "Sources/transcribe-cli",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .executableTarget(
+            name: "diarize-cli",
+            dependencies: [
+                .product(name: "WhisperKit", package: "WhisperKit"),
+                .product(name: "SpeakerKit", package: "WhisperKit"),
+            ],
+            path: "Sources/diarize-cli",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
     ]

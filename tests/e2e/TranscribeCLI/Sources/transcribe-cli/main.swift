@@ -1,25 +1,34 @@
 import Foundation
 import WhisperKit
 
-// Usage: transcribe-cli <audio.wav> [--language he] [--model openai_whisper-large-v3_turbo]
+// Usage: transcribe-cli <audio.wav> [--language he] [--model openai_whisper-large-v3_turbo] [--format text|json]
 //
-// Writes the plain transcript to stdout. Progress/info go to stderr so callers
-// can capture a clean transcript via shell redirection.
+// --format text : (default) plain transcript to stdout, newline-joined.
+// --format json : {"segments": [{"start": 0.0, "end": 3.5, "text": "..."}], "language": "he"}
+//
+// Progress/info go to stderr so callers can capture clean output via shell
+// redirection.
 
 struct Args {
     var audio: URL
     var language: String?
     var model: String
+    var format: String  // "text" | "json"
 }
 
 func parseArgs() -> Args {
     let argv = CommandLine.arguments
     guard argv.count >= 2 else {
-        fputs("Usage: transcribe-cli <audio> [--language he] [--model openai_whisper-large-v3_turbo]\n", stderr)
+        fputs(
+            "Usage: transcribe-cli <audio> [--language he] [--model openai_whisper-large-v3_turbo] " +
+            "[--format text|json]\n",
+            stderr
+        )
         exit(2)
     }
     var language: String?
     var model = "openai_whisper-large-v3_turbo"
+    var format = "text"
     var positional: String?
     var i = 1
     while i < argv.count {
@@ -34,6 +43,14 @@ func parseArgs() -> Args {
             i += 1
             guard i < argv.count else { fputs("--model requires value\n", stderr); exit(2) }
             model = argv[i]
+        case "--format":
+            i += 1
+            guard i < argv.count else { fputs("--format requires value\n", stderr); exit(2) }
+            let v = argv[i]
+            guard v == "text" || v == "json" else {
+                fputs("--format must be 'text' or 'json'\n", stderr); exit(2)
+            }
+            format = v
         default:
             positional = a
         }
@@ -42,7 +59,7 @@ func parseArgs() -> Args {
     guard let path = positional else {
         fputs("Missing audio path\n", stderr); exit(2)
     }
-    return Args(audio: URL(fileURLWithPath: path), language: language, model: model)
+    return Args(audio: URL(fileURLWithPath: path), language: language, model: model, format: format)
 }
 
 let args = parseArgs()
@@ -51,7 +68,7 @@ let home = FileManager.default.homeDirectoryForCurrentUser
 let modelsDir = home.appendingPathComponent(".transcribeer/models", isDirectory: true)
 try? FileManager.default.createDirectory(at: modelsDir, withIntermediateDirectories: true)
 
-fputs("[transcribe-cli] model=\(args.model) language=\(args.language ?? "auto")\n", stderr)
+fputs("[transcribe-cli] model=\(args.model) language=\(args.language ?? "auto") format=\(args.format)\n", stderr)
 fputs("[transcribe-cli] models_dir=\(modelsDir.path)\n", stderr)
 fputs("[transcribe-cli] audio=\(args.audio.path)\n", stderr)
 
@@ -94,10 +111,40 @@ func clean(_ s: String) -> String {
         .joined(separator: " ")
 }
 
-let text = results
-    .flatMap { $0.segments }
-    .map { clean($0.text) }
-    .filter { !$0.isEmpty }
-    .joined(separator: " ")
+struct SegmentJSON: Encodable {
+    let start: Double
+    let end: Double
+    let text: String
+}
 
-print(text)
+struct OutputJSON: Encodable {
+    let language: String?
+    let segments: [SegmentJSON]
+}
+
+let flatSegments = results.flatMap { $0.segments }
+
+if args.format == "json" {
+    let payload = OutputJSON(
+        language: args.language,
+        segments: flatSegments.compactMap { seg in
+            let text = clean(seg.text)
+            guard !text.isEmpty else { return nil }
+            return SegmentJSON(
+                start: Double(seg.start),
+                end: Double(seg.end),
+                text: text
+            )
+        }
+    )
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let data = try encoder.encode(payload)
+    if let text = String(data: data, encoding: .utf8) { print(text) }
+} else {
+    let text = flatSegments
+        .map { clean($0.text) }
+        .filter { !$0.isEmpty }
+        .joined(separator: " ")
+    print(text)
+}

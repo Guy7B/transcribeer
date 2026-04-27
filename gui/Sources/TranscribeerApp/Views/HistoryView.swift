@@ -235,12 +235,75 @@ struct HistoryView: View {
         case .done:
             Label("Done", systemImage: "checkmark.circle.fill")
                 .foregroundStyle(.green)
-        case .error(let msg):
-            Label(msg, systemImage: "exclamationmark.triangle.fill")
+        case .error(let msg, let sessionPath, let kind):
+            errorIndicator(message: msg, sessionPath: sessionPath, kind: kind)
+        }
+    }
+
+    /// Compact error indicator for the control bar — translates the raw
+    /// message into a user-friendly summary, then offers Open log / Retry /
+    /// Reveal in Finder buttons that all wrap onto the available width.
+    @ViewBuilder
+    private func errorIndicator(
+        message: String,
+        sessionPath: String?,
+        kind: AppState.ErrorKind,
+    ) -> some View {
+        let summary = friendlyErrorSummary(raw: message, kind: kind)
+        HStack(spacing: 8) {
+            Label(summary, systemImage: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
                 .lineLimit(1)
-                .help(msg)
+                .help(message)
+
+            if let sessionPath {
+                let sessionURL = URL(fileURLWithPath: sessionPath)
+                Button("Open log") {
+                    RunLogReader.openRunLog(in: sessionURL)
+                }
+                .buttonStyle(.borderless)
+                .controlSize(.small)
+                .tint(.secondary)
+                .help("Open run.log for this session")
+
+                if kind == .transcription {
+                    Button("Retry") {
+                        Task { _ = await runner.retryTranscription(sessionURL, config: config) }
+                    }
+                    .buttonStyle(.borderless)
+                    .controlSize(.small)
+                    .help("Retry the failed transcription (resumes from cached chunks)")
+                }
+
+                Button("Reveal in Finder") {
+                    RunLogReader.revealInFinder(sessionURL)
+                }
+                .buttonStyle(.borderless)
+                .controlSize(.small)
+                .tint(.secondary)
+                .help("Show the session folder in Finder")
+            }
         }
+    }
+
+    /// Translate the raw error from the pipeline (often a `URLError`
+    /// description) into something a user can act on. Falls back to the
+    /// raw message for cases we haven't matched yet.
+    private func friendlyErrorSummary(raw: String, kind: AppState.ErrorKind) -> String {
+        let lower = raw.lowercased()
+        if lower.contains("timed out") || lower.contains("timeout") {
+            return "Transcription timed out"
+        }
+        if lower.contains("network connection was lost") || lower.contains("connection was lost") {
+            return "Network connection lost — tap Retry to resume"
+        }
+        if lower.contains("not connected to the internet") || lower.contains("offline") {
+            return "Offline — reconnect and tap Retry"
+        }
+        if kind == .transcription {
+            return "Transcription failed"
+        }
+        return raw
     }
 
     @ViewBuilder

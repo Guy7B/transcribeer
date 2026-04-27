@@ -3,7 +3,6 @@ import SwiftUI
 struct SettingsView: View {
     @Binding var config: AppConfig
     @State private var apiKey: String = ""
-    @State private var modelCatalog = ModelCatalogService()
     @State private var apiKeySaveTask: Task<Void, Never>?
     @State private var pendingAPIKeyBackend: String?
 
@@ -13,7 +12,7 @@ struct SettingsView: View {
                 pipelineTab
             }
             Tab("Transcription", systemImage: "waveform") {
-                transcriptionTab
+                TranscriptionSettingsView(config: $config)
             }
             Tab("Summarization", systemImage: "text.badge.checkmark") {
                 summarizationTab
@@ -68,119 +67,6 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .padding(.top, 8)
-    }
-
-    // MARK: - Transcription
-
-    private var transcriptionTab: some View {
-        Form {
-            Section {
-                modelPicker
-                TextField("Custom model repo (optional)", text: Binding(
-                    get: { config.whisperModelRepo },
-                    set: { config.whisperModelRepo = $0 }
-                ))
-                .onSubmit { save() }
-            } header: {
-                HStack {
-                    Text("Whisper model")
-                    Spacer()
-                    if modelCatalog.isLoading {
-                        ProgressView().controlSize(.small)
-                    } else {
-                        Button {
-                            Task { await modelCatalog.refresh() }
-                        } label: {
-                            Image(systemName: "arrow.clockwise")
-                        }
-                        .buttonStyle(.borderless)
-                        .help("Refresh model list")
-                    }
-                }
-            } footer: {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Models are downloaded on first use (~0.1–1.5 GB). Stored in ~/.transcribeer/models/.")
-                    Text("Custom repo: HuggingFace repo for ivrit-ai or other fine-tuned models")
-                    Text("(e.g. owner/ivrit-ai-whisper-large-v3-turbo-coreml).")
-                    if let message = modelCatalog.lastError {
-                        Text(message).foregroundStyle(.orange)
-                    }
-                }
-                .foregroundStyle(.secondary)
-            }
-
-            Section {
-                Picker("Language", selection: Binding(
-                    get: { TranscriptionLanguage.from(config.language) },
-                    set: { config.language = $0.rawValue; save() },
-                )) {
-                    ForEach(TranscriptionLanguage.allCases) { option in
-                        Text(option.displayName).tag(option)
-                    }
-                }
-            } header: {
-                Text("Language")
-            } footer: {
-                Text(languageFooterText)
-                    .foregroundStyle(.secondary)
-            }
-
-            Section {
-                Picker("Speaker detection", selection: Binding(
-                    get: { config.diarization },
-                    set: { config.diarization = $0; save() },
-                )) {
-                    Text("pyannote").tag("pyannote")
-                    Text("none").tag("none")
-                }
-            } header: {
-                Text("Diarization")
-            } footer: {
-                Text(config.diarization == "none"
-                     ? "Disabled — transcript will have a single unlabelled speaker."
-                     : "Detects and labels multiple speakers in the transcript.")
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .formStyle(.grouped)
-        .padding(.top, 8)
-        .task {
-            // Make sure whatever the user has selected is visible in the list,
-            // then refresh from the network. If refresh fails the pre-seeded
-            // entry keeps the UI usable.
-            modelCatalog.ensureEntry(for: AppConfig.canonicalWhisperModel(config.whisperModel))
-            await modelCatalog.refresh()
-            modelCatalog.ensureEntry(for: AppConfig.canonicalWhisperModel(config.whisperModel))
-        }
-    }
-
-    private var languageFooterText: String {
-        if config.language == "auto" {
-            return "Auto-detect runs a language-ID pass before transcription. "
-                + "Explicit selection is faster and more reliable — recommended "
-                + "if you only record in one or two languages."
-        }
-        let name = TranscriptionLanguage.from(config.language).displayName
-        return "Whisper will transcribe as \(name). Override per-session from the transcript tab."
-    }
-
-    @ViewBuilder
-    private var modelPicker: some View {
-        let selected = AppConfig.canonicalWhisperModel(config.whisperModel)
-        Picker("Model", selection: Binding(
-            get: { selected },
-            set: { config.whisperModel = $0; save() }
-        )) {
-            if modelCatalog.entries.isEmpty {
-                Text(selected).tag(selected)
-            } else {
-                ForEach(modelCatalog.entries) { entry in
-                    ModelPickerRow(entry: entry).tag(entry.id)
-                }
-            }
-        }
-        .pickerStyle(.menu)
-        .disabled(modelCatalog.entries.isEmpty)
     }
 
     // MARK: - Summarization
@@ -299,8 +185,10 @@ struct SettingsView: View {
 /// One row in the Whisper model picker, rendering name + status badges.
 ///
 /// Kept as its own view so the `Picker` can render it both as the collapsed
-/// label and inside the menu without duplicating layout.
-private struct ModelPickerRow: View {
+/// label and inside the menu without duplicating layout. Used by
+/// `TranscriptionSettingsView` as well as `SettingsView`, so intentionally
+/// not `private`.
+struct ModelPickerRow: View {
     let entry: WhisperModelEntry
 
     var body: some View {

@@ -4,28 +4,6 @@ import TranscribeerCore
 
 private let logger = Logger(subsystem: "com.transcribeer", category: "pipeline")
 
-/// Appends timestamped lines to a session's `run.log` file.
-private struct SessionLogger {
-    let logPath: URL
-
-    func log(_ message: String) {
-        let timestamp = DateFormatter.localizedString(
-            from: Date(),
-            dateStyle: .none,
-            timeStyle: .medium
-        )
-        let data = Data("[\(timestamp)] \(message)\n".utf8)
-
-        if let handle = try? FileHandle(forWritingTo: logPath) {
-            handle.seekToEndOfFile()
-            handle.write(data)
-            try? handle.close()
-        } else {
-            try? data.write(to: logPath)
-        }
-    }
-}
-
 /// Runs the transcribeer pipeline using native Swift services.
 @Observable
 @MainActor
@@ -96,10 +74,14 @@ final class PipelineRunner {
         let audioPath = session.appendingPathComponent("audio.m4a")
         let transcriptPath = session.appendingPathComponent("transcript.txt")
         let summaryPath = session.appendingPathComponent("summary.md")
-        let logger = SessionLogger(logPath: session.appendingPathComponent("run.log"))
+        let logger = SessionLog(logPath: session.appendingPathComponent("run.log"))
 
         logger.log("session=\(session.path)")
         logger.log("pipeline=\(config.pipelineMode) lang=\(config.language) diarize=\(config.diarization)")
+        logger.log(
+            "backend=\(config.transcriptionBackend) model=\(modelForBackend(config: config)) " +
+            "llm_backend=\(config.llmBackend) llm_model=\(config.llmModel)",
+        )
 
         // 1. Record — in-process via CaptureCore (uses app's TCC permission)
         logger.log("capture started")
@@ -108,12 +90,12 @@ final class PipelineRunner {
         switch recordResult {
         case .permissionDenied(let detail):
             logger.log("capture failed: \(detail)")
-            state = .error(detail)
+            state = .error(message: detail, sessionPath: session.path, kind: .recording)
             NotificationManager.notifyError(detail)
             return
         case .error(let err):
             logger.log("capture failed: \(err)")
-            state = .error(err)
+            state = .error(message: err, sessionPath: session.path, kind: .recording)
             NotificationManager.notifyError(err)
             return
         case .noAudio:
@@ -124,7 +106,8 @@ final class PipelineRunner {
             let size = (try? FileManager.default.attributesOfItem(
                 atPath: audioPath.path
             )[.size] as? UInt64) ?? 0
-            logger.log("recorded \(size) bytes")
+            let sizeMB = Double(size) / (1024.0 * 1024.0)
+            logger.log("recorded \(size) bytes (\(String(format: "%.2f", sizeMB)) MB)")
         }
 
         if config.pipelineMode == "record-only" {
@@ -160,25 +143,31 @@ final class PipelineRunner {
         config: AppConfig,
         audioPath: URL,
         transcriptPath: URL,
-        logger: SessionLogger
+        logger: SessionLog
     ) async -> Bool {
         state = .transcribing
-        transcribingSession = transcriptPath.deletingLastPathComponent()
+        let session = transcriptPath.deletingLastPathComponent()
+        transcribingSession = session
         defer { transcribingSession = nil }
         logger.log("transcription started")
+        let started = Date()
 
         do {
             let result = try await transcribeAndFormat(
                 audioPath: audioPath,
                 language: config.language,
-                model: config.whisperModel,
-                modelRepo: config.whisperModelRepo,
-                diarization: config.diarization,
-                numSpeakers: config.numSpeakers
+                config: config,
+                logger: logger,
             )
-            try result.write(to: transcriptPath, atomically: true, encoding: .utf8)
-            SessionManager.setLanguage(transcriptPath.deletingLastPathComponent(), config.language)
-            logger.log("transcription done")
+            try storeTranscript(
+                result: result,
+                session: session,
+                config: config,
+                language: config.language,
+            )
+            SessionManager.setLanguage(session, config.language)
+            let elapsed = Date().timeIntervalSince(started)
+            logger.log("transcription done in \(String(format: "%.1f", elapsed))s")
             return true
         } catch is CancellationError {
             logger.log("transcription cancelled")
@@ -187,20 +176,77 @@ final class PipelineRunner {
         } catch {
             let message = "Transcription failed: \(error.localizedDescription)"
             logger.log(message)
-            state = .error(message)
+            state = .error(message: message, sessionPath: session.path, kind: .transcription)
             NotificationManager.notifyError(message)
             return false
         }
+    }
+
+    /// Hand a freshly-produced transcript to the persistence store. The
+    /// store owns filename allocation, manifest updates, and the
+    /// `transcript.txt` mirror that legacy code paths (and the
+    /// summarization stage) still read from. Pulled out of the happy-path
+    /// `performTranscription` so the function stays short and the error
+    /// paths aren't obscured by filesystem details.
+    private func storeTranscript(
+        result: String,
+        session: URL,
+        config: AppConfig,
+        language: String,
+    ) throws {
+        let kind = TranscriptionBackendKind.from(config.transcriptionBackend)
+        let diarization: String
+        switch kind {
+        case .googleStt where config.googleSttDiarize && !Self.shouldForcePyannote(language: language):
+            diarization = "google"
+        default:
+            diarization = config.diarization
+        }
+        let effectiveModel: String
+        switch kind {
+        case .googleStt: effectiveModel = config.googleSttModel
+        case .googleSttV2: effectiveModel = config.googleSttV2Model
+        case .whisperkit: effectiveModel = AppConfig.canonicalWhisperModel(config.whisperModel)
+        }
+
+        let input = TranscriptStore.NewTranscriptInput(
+            backend: config.transcriptionBackend,
+            model: effectiveModel,
+            language: language,
+            diarization: diarization,
+            content: result,
+        )
+        _ = try TranscriptStore.addTranscript(session: session, input: input, makeCurrent: true)
+    }
+
+    /// Whether the pipeline should override whatever inline diarization the
+    /// selected backend advertises and run Pyannote externally instead.
+    ///
+    /// Hebrew: Google's v1 diarization collapses a multi-speaker recording
+    /// into a single speaker (reproduced on 2026-04-23 with 4-speaker audio
+    /// and documented in tests/benchmarks/sttcompare/output/). Chirp 3's
+    /// diarization doesn't support Hebrew at all. Pyannote (language-
+    /// agnostic acoustic diarization via SpeakerKit) is the correct answer
+    /// in both cases.
+    static func shouldForcePyannote(language: String) -> Bool {
+        let normalized = language.lowercased()
+        return normalized == "he" || normalized.hasPrefix("he-") ||
+            normalized == "iw" || normalized.hasPrefix("iw-")
     }
 
     private func performSummarization(
         config: AppConfig,
         transcriptPath: URL,
         summaryPath: URL,
-        logger: SessionLogger
+        logger: SessionLog
     ) async {
         state = .summarizing
-        logger.log("summarization started backend=\(config.llmBackend) model=\(config.llmModel) profile=\(promptProfile ?? "default")")
+        logger.log(
+            "summarization started backend=\(config.llmBackend) " +
+            "model=\(config.llmModel) profile=\(promptProfile ?? "default")",
+        )
+        let started = Date()
+        var firstFragmentAt: Date?
         do {
             let transcript = try String(contentsOf: transcriptPath, encoding: .utf8)
             let customPrompt = SummarizationService.loadPromptProfile(promptProfile)
@@ -209,9 +255,17 @@ final class PipelineRunner {
                 transcript: transcript,
                 summaryPath: summaryPath,
                 config: config,
-                prompt: customPrompt
+                prompt: customPrompt,
+                onFirstFragment: {
+                    if firstFragmentAt == nil {
+                        firstFragmentAt = Date()
+                        let ttft = Date().timeIntervalSince(started)
+                        logger.log("summary first token in \(String(format: "%.2f", ttft))s")
+                    }
+                },
             )
-            logger.log("summarization done")
+            let elapsed = Date().timeIntervalSince(started)
+            logger.log("summarization done in \(String(format: "%.1f", elapsed))s")
         } catch {
             logger.log("summarization failed: \(error.localizedDescription)")
             // Non-fatal — transcript is what matters.
@@ -219,15 +273,22 @@ final class PipelineRunner {
     }
 
     /// Stream summary deltas from the LLM, mirroring them into `liveSummary`
-    /// for the detail view to render in real time. Writes the final text to
-    /// `summaryPath` before clearing the live state, so there is no flash of
-    /// stale disk content between stream-end and the caller's reload.
+    /// for the detail view to render in real time. On completion, attaches
+    /// the summary to the session's current transcript record (so the
+    /// summary follows that specific transcript, not the session as a
+    /// whole) and lets the store rewrite `summary.md` as its mirror.
+    ///
+    /// Falls back to writing `summaryPath` directly when the session has
+    /// no current record — shouldn't happen once migration has run, but
+    /// keeps the pipeline resilient if a malformed manifest is ever
+    /// encountered.
     private func streamSummary(
         session: URL,
         transcript: String,
         summaryPath: URL,
         config: AppConfig,
-        prompt: String?
+        prompt: String?,
+        onFirstFragment: (() -> Void)? = nil
     ) async throws -> String {
         summarizingSession = session
         liveSummary = ""
@@ -246,12 +307,26 @@ final class PipelineRunner {
         )
 
         var accumulated = ""
+        var sawFirst = false
         for try await fragment in stream {
             try Task.checkCancellation()
+            if !sawFirst {
+                sawFirst = true
+                onFirstFragment?()
+            }
             accumulated += fragment
             liveSummary = accumulated
         }
-        try accumulated.write(to: summaryPath, atomically: true, encoding: .utf8)
+
+        if let current = TranscriptStore.currentRecord(in: session) {
+            _ = try TranscriptStore.attachSummary(
+                session: session,
+                transcriptID: current.id,
+                content: accumulated,
+            )
+        } else {
+            try accumulated.write(to: summaryPath, atomically: true, encoding: .utf8)
+        }
         return accumulated
     }
 
@@ -262,53 +337,104 @@ final class PipelineRunner {
 
     // MARK: - Transcription + Diarization + Formatting
 
-    // swiftlint:disable:next function_parameter_count
+    /// Run the chosen transcription backend plus (optionally) external
+    /// diarization, merge the two, and return the formatted transcript.
+    ///
+    /// Backends that bring their own diarization (`producesDiarization ==
+    /// true`, e.g. Google STT) return pre-labeled `DiarSegment`s in their
+    /// `TranscriptionOutput`; the external `DiarizationService` pass is
+    /// skipped for those. Backends that don't (WhisperKit) run Pyannote in
+    /// parallel with the transcription request.
     private func transcribeAndFormat(
         audioPath: URL,
         language: String,
-        model: String,
-        modelRepo: String,
-        diarization: String,
-        numSpeakers: Int
+        config: AppConfig,
+        logger: SessionLog,
     ) async throws -> String {
-        // Guard: fail fast on silent recordings before the WhisperKit model
-        // load kicks off. The GUI is the primary producer of ScreenCaptureKit
-        // captures, so this is where a muted / no-playback capture would
-        // otherwise burn several minutes on a guaranteed-empty transcript.
+        // Guard: fail fast on silent recordings before any model load or
+        // network call. Cheap local check; catches muted / no-playback
+        // captures before they burn minutes (or API quota).
         try AudioValidation.ensureAudibleSignal(at: audioPath)
 
-        // Ensure the configured model is loaded. Runs on the service's
-        // MainActor but quickly hands off to a background task for the
-        // expensive compile/prewarm steps WhisperKit performs internally.
-        try await transcriptionService.loadModel(name: model, repo: modelRepo.isEmpty ? nil : modelRepo)
+        let backend = makeTranscriptionBackend(config: config, language: language)
+        let numSpeakers = config.numSpeakers > 0 ? config.numSpeakers : nil
+        let runExternalDiarization = !backend.producesDiarization && config.diarization != "none"
 
-        // Transcription and diarization are independent: both consume the
-        // same audio file and produce disjoint segment streams. Run them in
-        // parallel so the pipeline's wall time is dominated by the slower of
-        // the two instead of their sum.
-        async let whisperSegmentsTask = transcriptionService.transcribe(
+        let progressTracker = TranscriptionProgressTracker(logger: logger)
+
+        // Transcription and external diarization are independent: both
+        // consume the same audio file and produce disjoint segment streams.
+        // Run them in parallel so the pipeline's wall time is dominated by
+        // the slower of the two instead of their sum.
+        async let transcriptionTask: TranscriptionOutput = backend.transcribe(
             audioURL: audioPath,
-            language: language
+            language: language,
+            numSpeakers: numSpeakers,
+            onSegment: { _ in progressTracker.recordSegment() },
+            onProgress: { progressTracker.recordProgress($0) },
         )
 
-        async let diarSegmentsTask: [DiarSegment] = {
-            guard diarization != "none" else { return [] }
+        async let externalDiarTask: [DiarSegment] = {
+            guard runExternalDiarization else { return [] }
             return try await DiarizationService.diarize(
                 audioURL: audioPath,
-                numSpeakers: numSpeakers > 0 ? numSpeakers : nil
+                numSpeakers: numSpeakers,
             )
         }()
 
-        let whisperSegments = try await whisperSegmentsTask
-        let diarSegments = try await diarSegmentsTask
+        let output = try await transcriptionTask
+        let externalDiar = try await externalDiarTask
 
         try Task.checkCancellation()
 
+        let diarSegments = backend.producesDiarization ? output.diarSegments : externalDiar
+
         let labeled = TranscriptFormatter.assignSpeakers(
-            whisperSegments: whisperSegments,
-            diarSegments: diarSegments
+            whisperSegments: output.segments,
+            diarSegments: diarSegments,
         )
         return TranscriptFormatter.format(labeled)
+    }
+
+    /// Construct the `TranscriptionBackend` the pipeline should use for this
+    /// run, based on the current config. Called once per pipeline invocation
+    /// so config changes take effect without app restart.
+    ///
+    /// For WhisperKit, the backend wraps the long-lived
+    /// `transcriptionService` so repeated runs reuse the loaded model. Cloud
+    /// backends are stateless and cheap to construct.
+    ///
+    /// Hebrew carve-out: even when the user has `google_stt_diarize = true`
+    /// in config, we force `diarize: false` on the v1 backend so the
+    /// pipeline falls through to Pyannote. Google's v1 diarization is
+    /// unusable on Hebrew and users shouldn't need to toggle a second
+    /// setting to opt out.
+    private func makeTranscriptionBackend(
+        config: AppConfig,
+        language: String
+    ) -> TranscriptionBackend {
+        let kind = TranscriptionBackendKind.from(config.transcriptionBackend)
+        switch kind {
+        case .whisperkit:
+            return WhisperKitBackend(
+                service: transcriptionService,
+                modelName: config.whisperModel,
+                modelRepo: config.whisperModelRepo,
+            )
+        case .googleStt:
+            let diarize = config.googleSttDiarize && !Self.shouldForcePyannote(language: language)
+            return GoogleSTTBackend(
+                location: config.googleSttLocation,
+                model: config.googleSttModel,
+                diarize: diarize,
+            )
+        case .googleSttV2:
+            return GoogleSTTBackendV2(
+                project: config.googleSttV2Project,
+                region: config.googleSttV2Region,
+                model: config.googleSttV2Model,
+            )
+        }
     }
 
     // MARK: - History re-runs
@@ -332,7 +458,6 @@ final class PipelineRunner {
         guard let audioPath = SessionManager.audioURL(in: session) else {
             return CLIResult(ok: false, error: "Audio file not found")
         }
-        let txPath = session.appendingPathComponent("transcript.txt")
         let language = languageOverride ?? config.language
 
         logger.info("re-transcribe: \(audioPath.path) lang=\(language)")
@@ -345,25 +470,53 @@ final class PipelineRunner {
             if case .transcribing = state { state = previousState }
         }
 
+        let runLog = SessionLog(logPath: session.appendingPathComponent("run.log"))
+        runLog.log(
+            "re-transcribe started backend=\(config.transcriptionBackend) " +
+            "model=\(modelForBackend(config: config)) lang=\(language)",
+        )
+        let started = Date()
         do {
             let result = try await transcribeAndFormat(
                 audioPath: audioPath,
                 language: language,
-                model: config.whisperModel,
-                modelRepo: config.whisperModelRepo,
-                diarization: config.diarization,
-                numSpeakers: config.numSpeakers
+                config: config,
+                logger: runLog,
             )
-            try result.write(to: txPath, atomically: true, encoding: .utf8)
+            try storeTranscript(
+                result: result,
+                session: session,
+                config: config,
+                language: language,
+            )
             SessionManager.setLanguage(session, language)
+            let elapsed = Date().timeIntervalSince(started)
+            runLog.log("re-transcribe done in \(String(format: "%.1f", elapsed))s")
             return CLIResult(ok: true, error: "")
         } catch is CancellationError {
             logger.info("re-transcribe cancelled")
+            runLog.log("re-transcribe cancelled")
             return CLIResult(ok: false, error: "Cancelled")
         } catch {
             logger.error("re-transcribe failed: \(error.localizedDescription)")
+            runLog.log("re-transcribe failed: \(error.localizedDescription)")
             return CLIResult(ok: false, error: error.localizedDescription)
         }
+    }
+
+    /// Retry transcription for a session that previously failed (e.g. a
+    /// long Hebrew recording that lost its connection partway through).
+    /// Thin wrapper over `transcribeSession` that:
+    ///   - resets `.error` state to `.idle` so the UI doesn't keep showing
+    ///     the previous failure while the retry runs
+    ///   - lets the underlying backend reuse its `.stt-cache` directory so
+    ///     work already completed on the previous run isn't redone
+    ///
+    /// Called from the History row's "Retry" button and the session detail
+    /// banner.
+    func retryTranscription(_ session: URL, config: AppConfig) async -> CLIResult {
+        if case .error = state { state = .idle }
+        return await transcribeSession(session, config: config)
     }
 
     /// Optional one-shot overrides for a single re-summarize call.
@@ -459,5 +612,69 @@ final class PipelineRunner {
             return root + "\n\nAdditional instructions from the user:\n" + trimmedFocus
         }
         return base
+    }
+
+    // MARK: - Logging helpers
+
+    /// Resolve the model name for the active transcription backend so the
+    /// session log captures the same value the user would see in Settings.
+    fileprivate func modelForBackend(config: AppConfig) -> String {
+        switch TranscriptionBackendKind.from(config.transcriptionBackend) {
+        case .whisperkit:
+            return AppConfig.canonicalWhisperModel(config.whisperModel)
+        case .googleStt:
+            return config.googleSttModel
+        case .googleSttV2:
+            return config.googleSttV2Model
+        }
+    }
+}
+
+// MARK: - TranscriptionProgressTracker
+
+/// Throttles transcription progress + segment logging so a backend that
+/// emits hundreds of `onProgress` callbacks per second doesn't drown the
+/// session log. Crosses actor boundaries (the backend invokes the
+/// callbacks from arbitrary executors), hence the lock-protected state
+/// and `@unchecked Sendable` conformance.
+private final class TranscriptionProgressTracker: @unchecked Sendable {
+    private let logger: SessionLog
+    private let lock = NSLock()
+    private var lastLoggedDecile: Int = -1
+    private var lastLogAt: Date = .distantPast
+    private var segmentCount: Int = 0
+
+    /// Don't emit more than one progress line per this many seconds even
+    /// if multiple decile boundaries are crossed in quick succession.
+    private let minInterval: TimeInterval = 5
+
+    init(logger: SessionLog) {
+        self.logger = logger
+    }
+
+    func recordProgress(_ value: Double) {
+        let clamped = max(0, min(1, value))
+        let decile = Int(clamped * 10)
+        let now = Date()
+        lock.lock()
+        let shouldLog = decile > lastLoggedDecile && now.timeIntervalSince(lastLogAt) >= minInterval
+        if shouldLog {
+            lastLoggedDecile = decile
+            lastLogAt = now
+        }
+        lock.unlock()
+        if shouldLog {
+            logger.log("transcription \(decile * 10)%")
+        }
+    }
+
+    func recordSegment() {
+        lock.lock()
+        segmentCount += 1
+        let count = segmentCount
+        lock.unlock()
+        if count % 50 == 0 {
+            logger.log("transcription segments=\(count)")
+        }
     }
 }

@@ -8,7 +8,18 @@ enum AppState: Equatable {
     case transcribing
     case summarizing
     case done(sessionPath: String)
-    case error(String)
+    case error(message: String, sessionPath: String?, kind: ErrorKind)
+
+    /// Categorises which pipeline stage produced the failure so the UI can
+    /// pick an icon/wording and route the retry button to the right action.
+    /// Kept narrow on purpose — this is what the UI cares about, not a full
+    /// taxonomy of every underlying error type.
+    enum ErrorKind: Equatable {
+        case transcription
+        case recording
+        case summarization
+        case other
+    }
 
     var isRecording: Bool {
         if case .recording = self { return true }
@@ -39,8 +50,27 @@ enum AppState: Equatable {
         case .transcribing: return "📝 Transcribing…"
         case .summarizing: return "🤔 Summarizing…"
         case .done: return "✓ Done"
-        case .error(let msg): return "⚠ \(msg)"
+        case .error(let msg, _, _): return "⚠ \(msg)"
         }
+    }
+
+    /// Convenience for callers that just want the message (legacy callsites,
+    /// menubar dropdown, etc.) without unpacking the full payload.
+    var errorMessage: String? {
+        if case .error(let msg, _, _) = self { return msg }
+        return nil
+    }
+
+    /// Session path attached to the failure, if any. Used by the UI to wire
+    /// "Open log" / "Reveal in Finder" / "Retry" actions.
+    var errorSessionPath: String? {
+        if case .error(_, let path, _) = self { return path }
+        return nil
+    }
+
+    var errorKind: ErrorKind? {
+        if case .error(_, _, let kind) = self { return kind }
+        return nil
     }
 
     private static func recordingText(from start: Date) -> String {

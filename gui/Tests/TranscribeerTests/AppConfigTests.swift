@@ -17,6 +17,13 @@ struct AppConfigTests {
         #expect(cfg.pipelineMode == "record+transcribe+summarize")
         #expect(!cfg.zoomAutoRecord)
         #expect(cfg.promptOnStop)
+
+        // Google STT v2 (Chirp) — new fields default to empty project + the
+        // multi-region Chirp 3 endpoint so the settings UI has sensible
+        // placeholders and unknown users don't accidentally hit Chirp 2.
+        #expect(cfg.googleSttV2Project == "")
+        #expect(cfg.googleSttV2Region == "us")
+        #expect(cfg.googleSttV2Model == "chirp_3")
     }
 
     @Test("expandedSessionsDir resolves tilde to home directory")
