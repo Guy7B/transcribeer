@@ -42,20 +42,32 @@ struct AudioSettingsView: View {
                     }
                 }
 
-                Toggle("Echo cancellation", isOn: Binding(
+                Picker("Echo cancellation", selection: Binding(
                     get: { config.audio.aec },
                     set: { newValue in
                         config.audio.aec = newValue
                         save()
                     }
-                ))
+                )) {
+                    ForEach(AECMode.allCases, id: \.self) { mode in
+                        Text(mode.displayName).tag(mode)
+                    }
+                }
             } header: {
                 Text("Devices")
             } footer: {
-                Text(
-                    "Select non-default devices when you want to capture "
-                        + "a specific microphone or route system audio through a particular output."
-                )
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(
+                        "Select non-default devices when you want to capture "
+                            + "a specific microphone or route system audio "
+                            + "through a particular output."
+                    )
+                    Text(
+                        "Echo cancellation prevents speaker audio from bleeding into the mic track. "
+                            + "It puts the audio session into voice-call mode (lower volume, voice EQ on system playback) while recording, so it's only worth running when speakers and mic share an acoustic path. "
+                            + "Automatic checks the active output device at recording start: wired headphones → off; speakers, AirPods, monitor, AirPlay → on."
+                    )
+                }
                 .foregroundStyle(.secondary)
             }
 

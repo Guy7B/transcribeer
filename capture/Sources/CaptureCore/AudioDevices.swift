@@ -116,6 +116,47 @@ public enum AudioDevices {
         defaultDeviceID(selector: kAudioHardwarePropertyDefaultOutputDevice)
     }
 
+    // MARK: - Device classification
+
+    /// Core Audio transport type for a device (e.g. `kAudioDeviceTransportTypeBuiltIn`,
+    /// `kAudioDeviceTransportTypeBluetooth`). Returns `nil` if the property
+    /// isn't queryable on this device.
+    ///
+    /// Used by callers that need to make routing decisions based on the
+    /// physical class of the device (built-in speaker vs. headphones jack vs.
+    /// AirPods, etc.) — for example, deciding whether to enable
+    /// echo cancellation on the mic capture path.
+    public static func transportType(deviceID: AudioDeviceID) -> UInt32? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var transport: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &transport) == noErr
+        else { return nil }
+        return transport
+    }
+
+    /// FourCC of the active output data source (e.g. `'spkr'` = internal
+    /// speakers, `'hdpn'` = headphone jack). Only meaningful on devices that
+    /// expose a data-source selector — typically the built-in audio device on
+    /// Macs with a 3.5 mm jack. `nil` otherwise.
+    public static func outputDataSource(deviceID: AudioDeviceID) -> UInt32? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDataSource,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectHasProperty(deviceID, &address) else { return nil }
+        var source: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &source) == noErr
+        else { return nil }
+        return source
+    }
+
     // MARK: - Shared helpers
 
     private static func deviceName(for deviceID: AudioDeviceID) -> String? {

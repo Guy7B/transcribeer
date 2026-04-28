@@ -65,10 +65,36 @@ struct AppConfig: Equatable {
     struct AudioSettings: Equatable {
         var inputDeviceUID: String = ""
         var outputDeviceUID: String = ""
-        var aec: Bool = true
+        var aec: AECMode = .auto
         var selfLabel: String = "You"
         var otherLabel: String = "Them"
         var diarizeMicMultiuser: Bool = false
+    }
+}
+
+/// Acoustic echo cancellation mode for mic capture. Drives whether
+/// `MicCapture` engages `setVoiceProcessingEnabled(true)` — which yields a
+/// clean mic track on speaker-bleed scenarios at the cost of putting the
+/// whole audio session into voice/communication mode (compressed dynamic
+/// range, lowered output volume, voice-EQ on system playback).
+enum AECMode: String, CaseIterable, Equatable, Sendable {
+    /// Inspect the active output device transport at recording start.
+    /// Wired headphones → off, anything that shares acoustic path with the
+    /// mic → on. The right answer for most users.
+    case auto
+    /// Always engage Voice Processing IO. Use when you record on speakers
+    /// without headphones and don't want the mic track to capture playback.
+    case on
+    /// Never engage Voice Processing IO. Use when you always wear
+    /// headphones and want untouched output fidelity.
+    case off
+
+    var displayName: String {
+        switch self {
+        case .auto: return "Automatic"
+        case .on: return "Always on"
+        case .off: return "Always off"
+        }
     }
 }
 
@@ -123,7 +149,13 @@ struct PathsSection: Decodable {
 struct AudioSection: Decodable {
     var input_device_uid: String?
     var output_device_uid: String?
+    /// Legacy boolean form: `aec = true | false`. Kept for backward
+    /// compatibility — older config.toml files written before the
+    /// `auto/on/off` enum existed used this. Migrated on read.
     var aec: Bool?
+    /// New tri-state form: `aec_mode = "auto" | "on" | "off"`. Wins over
+    /// the legacy `aec` field when both are present.
+    var aec_mode: String?
     var self_label: String?
     var other_label: String?
     var diarize_mic_multiuser: Bool?
@@ -214,10 +246,26 @@ enum ConfigManager {
     private static func applyAudio(_ s: AudioSection, to cfg: inout AppConfig) {
         cfg.audio.inputDeviceUID = s.input_device_uid ?? cfg.audio.inputDeviceUID
         cfg.audio.outputDeviceUID = s.output_device_uid ?? cfg.audio.outputDeviceUID
-        cfg.audio.aec = s.aec ?? cfg.audio.aec
+        cfg.audio.aec = resolveAECMode(modeString: s.aec_mode, legacyBool: s.aec)
+            ?? cfg.audio.aec
         cfg.audio.selfLabel = s.self_label ?? cfg.audio.selfLabel
         cfg.audio.otherLabel = s.other_label ?? cfg.audio.otherLabel
         cfg.audio.diarizeMicMultiuser = s.diarize_mic_multiuser ?? cfg.audio.diarizeMicMultiuser
+    }
+
+    /// Pick the AEC mode from whichever form the TOML file used. New form
+    /// (`aec_mode = "auto"`) wins over legacy boolean (`aec = true`) when
+    /// both are present so a partial migration doesn't silently downgrade.
+    /// Returns `nil` when neither field was set so the caller can fall back
+    /// to the existing default rather than overwriting it.
+    private static func resolveAECMode(modeString: String?, legacyBool: Bool?) -> AECMode? {
+        if let modeString, let parsed = AECMode(rawValue: modeString) {
+            return parsed
+        }
+        if let legacyBool {
+            return legacyBool ? .on : .off
+        }
+        return nil
     }
 
     static func save(_ cfg: AppConfig) {
@@ -259,7 +307,7 @@ enum ConfigManager {
         [audio]
         input_device_uid = \(tomlString(cfg.audio.inputDeviceUID))
         output_device_uid = \(tomlString(cfg.audio.outputDeviceUID))
-        aec = \(cfg.audio.aec)
+        aec_mode = \(tomlString(cfg.audio.aec.rawValue))
         self_label = \(tomlString(cfg.audio.selfLabel))
         other_label = \(tomlString(cfg.audio.otherLabel))
         diarize_mic_multiuser = \(cfg.audio.diarizeMicMultiuser)

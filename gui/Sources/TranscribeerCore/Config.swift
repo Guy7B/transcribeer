@@ -28,14 +28,28 @@ public struct AppConfig: Equatable, Sendable {
     public struct AudioSettings: Equatable, Sendable {
         public var inputDeviceUID: String = ""
         public var outputDeviceUID: String = ""
-        public var aec: Bool = true
+        public var aec: AECMode = .auto
         public var selfLabel: String = "You"
         public var otherLabel: String = "Them"
         public var diarizeMicMultiuser: Bool = false
 
         public init() {}
     }
+}
 
+/// Acoustic echo cancellation mode for mic capture. Mirrors the GUI-side
+/// `AECMode` enum; kept in `TranscribeerCore` so non-GUI consumers (CLI,
+/// tests, external tools) can read/write the same config field.
+public enum AECMode: String, CaseIterable, Equatable, Sendable {
+    case auto
+    case on
+    case off
+}
+
+// Computed/static helpers live in an extension so the new `AECMode` enum can
+// sit between the data definition and the helpers without splitting the
+// struct body across two files.
+extension AppConfig {
     public var expandedSessionsDir: String {
         (sessionsDir as NSString).expandingTildeInPath
     }
@@ -93,8 +107,12 @@ private struct PathsSection: Decodable {
 private struct AudioSection: Decodable {
     var input_device_uid: String?
     var output_device_uid: String?
+    // Legacy boolean form (`aec = true | false`) preserved for backward
+    // compatibility with config.toml files written before the auto/on/off
+    // tri-state existed. New form below wins when both are present.
     // swiftlint:disable:next discouraged_optional_boolean
     var aec: Bool?
+    var aec_mode: String?
     var self_label: String?
     var other_label: String?
     // swiftlint:disable:next discouraged_optional_boolean
@@ -157,10 +175,26 @@ public enum ConfigManager {
     private static func applyAudio(_ section: AudioSection, to cfg: inout AppConfig) {
         if let v = section.input_device_uid { cfg.audio.inputDeviceUID = v }
         if let v = section.output_device_uid { cfg.audio.outputDeviceUID = v }
-        if let v = section.aec { cfg.audio.aec = v }
+        if let v = resolveAECMode(modeString: section.aec_mode, legacyBool: section.aec) {
+            cfg.audio.aec = v
+        }
         if let v = section.self_label { cfg.audio.selfLabel = v }
         if let v = section.other_label { cfg.audio.otherLabel = v }
         if let v = section.diarize_mic_multiuser { cfg.audio.diarizeMicMultiuser = v }
+    }
+
+    /// Pick the AEC mode from whichever form the TOML file used. Mirrors
+    /// `Models/Config.swift`'s helper so both AppConfig flavours migrate the
+    /// same way. Returns `nil` when neither field was set so the caller
+    /// preserves the existing default.
+    private static func resolveAECMode(modeString: String?, legacyBool: Bool?) -> AECMode? {
+        if let modeString, let parsed = AECMode(rawValue: modeString) {
+            return parsed
+        }
+        if let legacyBool {
+            return legacyBool ? .on : .off
+        }
+        return nil
     }
 
     public static func save(_ cfg: AppConfig) {
@@ -198,7 +232,7 @@ public enum ConfigManager {
         [audio]
         input_device_uid = \(tomlString(cfg.audio.inputDeviceUID))
         output_device_uid = \(tomlString(cfg.audio.outputDeviceUID))
-        aec = \(cfg.audio.aec)
+        aec_mode = \(tomlString(cfg.audio.aec.rawValue))
         self_label = \(tomlString(cfg.audio.selfLabel))
         other_label = \(tomlString(cfg.audio.otherLabel))
         diarize_mic_multiuser = \(cfg.audio.diarizeMicMultiuser)

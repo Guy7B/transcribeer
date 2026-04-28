@@ -306,14 +306,18 @@ reset-mac-permissions:
 	@echo "→ killing running instances"
 	-pkill -f TranscribeerApp 2>/dev/null || true
 	@echo "→ resetting user-level TCC (Microphone, SystemAudioRecording, SystemPolicyAllFiles)"
-	-@for svc in Microphone SystemAudioRecording SystemPolicyAllFiles; do \
-		tccutil reset $$svc com.transcribeer.menubar 2>/dev/null || true; \
+	-@for bid in com.transcribeer.menubar com.transcribeer.menubar.dev; do \
+		for svc in Microphone SystemAudioRecording SystemPolicyAllFiles; do \
+			tccutil reset $$svc $$bid 2>/dev/null || true; \
+		done; \
 	done
 	@echo "→ resetting system-level TCC (Accessibility, ListenEvent, PostEvent) — needs sudo"
-	-@for svc in Accessibility ListenEvent PostEvent; do \
-		sudo tccutil reset $$svc com.transcribeer.menubar 2>/dev/null || true; \
+	-@for bid in com.transcribeer.menubar com.transcribeer.menubar.dev; do \
+		for svc in Accessibility ListenEvent PostEvent; do \
+			sudo tccutil reset $$svc $$bid 2>/dev/null || true; \
+		done; \
 	done
-	@echo "✓ done. Relaunch with: make gui"
+	@echo "✓ done. Relaunch with: make gui  (or open the dev variant)"
 
 # ── logs ──────────────────────────────────────────────────────────────────────
 logs:

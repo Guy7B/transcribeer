@@ -13,6 +13,12 @@ struct HistoryView: View {
     @State private var searchText = ""
     @State private var profiles: [String] = ["default"]
     @State private var statusText = ""
+    /// Cached `AXIsProcessTrusted()` snapshot. Driving the banner through
+    /// state instead of calling `AccessibilityGuard.isTrusted` from the view
+    /// body lets the banner update without an app restart when the user
+    /// toggles permission in System Settings — the polling task below
+    /// refreshes this every 2 s while the window is visible.
+    @State private var isAccessibilityTrusted: Bool = AccessibilityGuard.isTrusted
     /// Sessions queued for confirmation — either a right-clicked row or the
     /// entire selection when the user hits Delete with multiple rows selected.
     /// Drives the confirmation dialog so nothing is deleted in a single click.
@@ -37,17 +43,21 @@ struct HistoryView: View {
     @Environment(\.openSettings) private var openSettingsEnv
 
     var body: some View {
-        NavigationSplitView {
-            sidebar
-        } detail: {
-            VStack(spacing: 0) {
-                accessibilityBanner
-                controlBar
-                Divider()
+        VStack(spacing: 0) {
+            // Window-level chrome lives OUTSIDE NavigationSplitView so its
+            // intrinsic height doesn't compose with the (potentially very tall)
+            // SessionDetailView body. With these inside the detail-pane VStack
+            // a long summary would balloon the NavigationSplitView past the
+            // window height, pushing the controlBar above the visible bounds.
+            accessibilityBanner
+            controlBar
+            Divider()
+            NavigationSplitView {
+                sidebar
+            } detail: {
                 detailPanel
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(minWidth: 800, minHeight: 500)
         .onAppear {
@@ -57,6 +67,20 @@ struct HistoryView: View {
         }
         .onDisappear {
             DockVisibility.windowDidDisappear()
+        }
+        // Re-poll Accessibility trust while the window is visible so the
+        // banner can disappear within ~2 s of the user flipping the toggle in
+        // System Settings, without an app restart. macOS doesn't push
+        // notifications on TCC changes; polling AXIsProcessTrusted is cheap
+        // (a single TCC cache lookup) so the loop is harmless.
+        .task {
+            while !Task.isCancelled {
+                let trusted = AccessibilityGuard.isTrusted
+                if trusted != isAccessibilityTrusted {
+                    isAccessibilityTrusted = trusted
+                }
+                try? await Task.sleep(for: .seconds(2))
+            }
         }
         .onChange(of: runner.state) { _, newState in
             handleStateChange(newState)
@@ -111,7 +135,7 @@ struct HistoryView: View {
 
     @ViewBuilder
     private var accessibilityBanner: some View {
-        if config.zoomEnricherEnabled, !AccessibilityGuard.isTrusted {
+        if config.zoomEnricherEnabled, !isAccessibilityTrusted {
             HStack(spacing: 10) {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)

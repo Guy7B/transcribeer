@@ -78,7 +78,9 @@ enum CaptureService {
         let recorder = DualAudioRecorder(sessionDir: sessionDir)
         recorder.inputDeviceID = resolveMicDevice(uid: audio.inputDeviceUID)
         recorder.outputDeviceID = resolveOutputDevice(uid: audio.outputDeviceUID)
-        recorder.echoCancellation = audio.aec
+        let aec = resolveEchoCancellation(audio: audio, outputDeviceID: recorder.outputDeviceID)
+        recorder.echoCancellation = aec.enabled
+        logger.info("aec mode=\(audio.aec.rawValue, privacy: .public) reason=\(aec.reason, privacy: .public) → enabled=\(aec.enabled, privacy: .public)")
 
         do {
             try await recorder.start()
@@ -150,12 +152,15 @@ enum CaptureService {
     static func describeDevices(audio: AppConfig.AudioSettings) -> [String] {
         let inputs = AudioDevices.availableInputDevices()
         let outputs = AudioDevices.availableOutputDevices()
+        let resolvedOutputID = resolveOutputDevice(uid: audio.outputDeviceUID)
+            ?? AudioDevices.defaultOutputDeviceID()
+        let aec = resolveEchoCancellation(audio: audio, outputDeviceID: resolvedOutputID)
         return [
             "audio.input=\(selected(uid: audio.inputDeviceUID, in: inputs))"
                 + " default=\(name(of: AudioDevices.defaultInputDeviceID(), in: inputs))",
             "audio.output=\(selected(uid: audio.outputDeviceUID, in: outputs))"
                 + " default=\(name(of: AudioDevices.defaultOutputDeviceID(), in: outputs))",
-            "audio.aec=\(audio.aec)",
+            "audio.aec.mode=\(audio.aec.rawValue) effective=\(aec.enabled) reason=\(aec.reason)",
         ]
     }
 
@@ -172,6 +177,55 @@ enum CaptureService {
     private static func name(of deviceID: AudioDeviceID?, in devices: [DeviceInfo]) -> String {
         guard let deviceID else { return "unknown" }
         return devices.first(where: { $0.id == deviceID })?.name ?? "unknown"
+    }
+
+    // MARK: - AEC resolution
+
+    /// Decision returned by `resolveEchoCancellation`: the boolean to feed
+    /// `DualAudioRecorder.echoCancellation`, plus a short human-readable
+    /// reason suitable for the run log.
+    struct AECDecision: Equatable {
+        let enabled: Bool
+        let reason: String
+    }
+
+    /// Translate the user's `AECMode` setting into an effective on/off
+    /// boolean, factoring in the current output device when the user has
+    /// asked for `.auto`.
+    ///
+    /// The reason string lands in `run.log` so a future user reading back a
+    /// session can see exactly why AEC went the way it did ("auto: built-in
+    /// speakers detected", "auto: headphones jack — skipped", "manual: on",
+    /// etc.). Pure with respect to its inputs — easy to test by feeding a
+    /// stub device ID.
+    static func resolveEchoCancellation(
+        audio: AppConfig.AudioSettings,
+        outputDeviceID: AudioDeviceID?
+    ) -> AECDecision {
+        switch audio.aec {
+        case .on:
+            return AECDecision(enabled: true, reason: "manual: on")
+        case .off:
+            return AECDecision(enabled: false, reason: "manual: off")
+        case .auto:
+            guard let outputDeviceID else {
+                // No detectable output device — be safe and engage AEC so
+                // the mic track stays clean if the user is on speakers.
+                return AECDecision(enabled: true, reason: "auto: no output detected — defaulting on")
+            }
+            let cls = OutputDeviceClassifier.classify(deviceID: outputDeviceID)
+            let enabled = OutputDeviceClassifier.aecRecommended(for: cls)
+            return AECDecision(enabled: enabled, reason: "auto: \(reasonLabel(for: cls))")
+        }
+    }
+
+    private static func reasonLabel(for cls: OutputDeviceClass) -> String {
+        switch cls {
+        case .headphonesIsolated: return "wired headphones — no acoustic feedback"
+        case .speakerLikely: return "speakers / monitor / AirPlay — feedback risk"
+        case .earbudsCoupled: return "Bluetooth earbuds — coupling risk"
+        case .unknown: return "unknown transport — defaulting on"
+        }
     }
 
     /// Signal the active recording to stop.

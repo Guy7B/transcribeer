@@ -83,6 +83,7 @@ struct SessionDetailView: View {
             tabBar
 
             tabContent
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             if showProgressRow {
                 Divider()
@@ -93,6 +94,7 @@ struct SessionDetailView: View {
                 )
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Menu {
@@ -322,6 +324,7 @@ struct SessionDetailView: View {
             Divider()
             summaryBody
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     @ViewBuilder
